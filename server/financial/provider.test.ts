@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { signWebhookPayload, verifyWebhookSignature } from "./provider";
+import { PROVIDER_API_VERSION, SandboxBankAdapter, signWebhookPayload, verifyWebhookSignature } from "./provider";
 
 describe("sandbox provider webhook verification", () => {
   const secret = "test-only-secret";
@@ -22,5 +22,26 @@ describe("sandbox provider webhook verification", () => {
     const signature = signWebhookPayload(secret, timestamp, body);
     expect(verifyWebhookSignature({ secret, signature, timestamp, body, now: new Date(now.getTime() + 301_000) })).toMatchObject({ ok: false, reason: "expired_timestamp" });
     expect(verifyWebhookSignature({ secret, signature, timestamp: "not-a-time", body, now })).toMatchObject({ ok: false, reason: "invalid_timestamp" });
+  });
+});
+
+describe("sandbox provider reconciliation contract", () => {
+  it("stays deterministic and never guesses a terminal outcome", async () => {
+    const adapter = new SandboxBankAdapter();
+    expect(adapter.apiVersion).toBe(PROVIDER_API_VERSION);
+
+    const result = await adapter.reconcile({
+      transferReference: "TX-20260927-ABCD1234",
+      providerReference: null,
+      idempotencyKey: "idem-provider-test",
+      amountMinor: 25_000,
+      currency: "HNL",
+    });
+
+    expect(result).toEqual({
+      providerReference: "SBX-TX-20260927-ABCD1234",
+      status: "processing",
+      amountMinor: 25_000,
+    });
   });
 });
