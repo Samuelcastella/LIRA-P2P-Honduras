@@ -95,6 +95,9 @@ jobs:
       - name: Build production bundle
         run: pnpm build
 
+      - name: Build canonical backend service entrypoints
+        run: pnpm build:api && pnpm build:worker && pnpm build:reconciliation
+
       - name: Build lira-web container
         run: docker build -f Dockerfile.web -t lira-web-ci .
 

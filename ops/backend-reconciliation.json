@@ -49,12 +49,17 @@
   ],
   "serviceTopology": {
     "baseline": "independent-api-worker-reconciliation",
-    "canonical": "monolithic-server-only",
-    "status": "blocking",
+    "canonical": "independent-api-worker-reconciliation",
+    "status": "verified",
     "requiredCanonicalBuildScripts": [
       "build:api",
       "build:worker",
       "build:reconciliation"
+    ],
+    "requiredCanonicalSourceFiles": [
+      "services/api/index.ts",
+      "services/worker/index.ts",
+      "services/reconciliation/index.ts"
     ]
   }
 }
