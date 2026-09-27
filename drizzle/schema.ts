@@ -52,7 +52,7 @@ export const dailyTransferControls = mysqlTable(
   ],
 );
 
-/** Trusted device metadata for the sandbox; use a platform credential in a real implementation. */
+/** Browser/device fingerprints are discovery signals, never automatic trust. */
 export const trustedDevices = mysqlTable(
   "trusted_devices",
   {
@@ -61,14 +61,20 @@ export const trustedDevices = mysqlTable(
     fingerprintHash: varchar("fingerprintHash", { length: 64 }).notNull(),
     label: varchar("label", { length: 100 }).notNull(),
     platform: varchar("platform", { length: 80 }).notNull(),
-    trustedAt: timestamp("trustedAt").defaultNow().notNull(),
+    status: mysqlEnum("device_trust_status", ["new", "pending", "trusted", "restricted", "revoked"]).default("new").notNull(),
+    enrollmentRequestedAt: timestamp("enrollmentRequestedAt").defaultNow().notNull(),
+    eligibleAt: timestamp("eligibleAt"),
+    trustedAt: timestamp("trustedAt"),
+    trustMethod: varchar("trustMethod", { length: 80 }),
     lastUsedAt: timestamp("lastUsedAt").defaultNow().notNull(),
     revokedAt: timestamp("revokedAt"),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
   },
   (table) => [
     uniqueIndex("trusted_device_user_fingerprint_unique").on(table.userId, table.fingerprintHash),
     index("trusted_device_user_idx").on(table.userId, table.lastUsedAt),
+    index("trusted_device_status_idx").on(table.userId, table.status),
   ],
 );
 
@@ -81,9 +87,11 @@ export const securitySessions = mysqlTable(
     deviceId: varchar("deviceId", { length: 36 }).notNull().references(() => trustedDevices.id),
     sessionFingerprintHash: varchar("sessionFingerprintHash", { length: 64 }).notNull(),
     label: varchar("label", { length: 100 }).notNull(),
+    authStrength: varchar("authStrength", { length: 32 }).default("basic").notNull(),
     lastSeenAt: timestamp("lastSeenAt").defaultNow().notNull(),
     revokedAt: timestamp("revokedAt"),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
   },
   (table) => [
     uniqueIndex("security_session_user_fingerprint_unique").on(table.userId, table.sessionFingerprintHash),
@@ -98,7 +106,7 @@ export const otpChallenges = mysqlTable(
     id: varchar("id", { length: 36 }).primaryKey(),
     userId: int("userId").notNull().references(() => users.id),
     sessionId: varchar("sessionId", { length: 36 }).notNull().references(() => securitySessions.id),
-    purpose: mysqlEnum("otp_purpose", ["transfer"]).notNull(),
+    purpose: mysqlEnum("otp_purpose", ["transfer", "device_enrollment"]).notNull(),
     codeHash: varchar("codeHash", { length: 255 }).notNull(),
     status: mysqlEnum("otp_challenge_status", ["issued", "verified", "consumed", "expired", "locked"]).default("issued").notNull(),
     attempts: int("attempts").default(0).notNull(),
