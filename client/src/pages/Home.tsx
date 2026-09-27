@@ -544,14 +544,22 @@ function SecurityView({ securityContext, biometricsEnabled, onToggle }: { securi
         setDeviceEnrollmentChallengeId(null);
         setDeviceEnrollmentSandboxCode(null);
         toast.success("Este dispositivo ya es confiable.");
-      } else if (result.coolingDown) {
-        setDeviceEnrollmentChallengeId(null);
-        setDeviceEnrollmentSandboxCode(null);
-        toast.message("El dispositivo quedó pendiente. El código OTP se generará cuando termine el periodo de enfriamiento.");
       } else {
-        setDeviceEnrollmentChallengeId(result.challengeId);
-        setDeviceEnrollmentSandboxCode(result.sandboxCode);
-        toast.message("Código OTP generado para verificar este dispositivo.");
+        const eligibleAtMs = result.eligibleAt ? new Date(result.eligibleAt).getTime() : null;
+        const coolingDown = result.coolingDown === true || (eligibleAtMs !== null && eligibleAtMs > Date.now());
+        if (coolingDown) {
+          // The deployed hardened API still returns an OTP during cooling. Never retain an OTP
+          // that is guaranteed to expire before the device becomes eligible; request a fresh one later.
+          setDeviceEnrollmentChallengeId(null);
+          setDeviceEnrollmentSandboxCode(null);
+          setDeviceEnrollmentOtp("");
+          toast.message("El dispositivo quedó pendiente. Genera un código nuevo cuando termine el periodo de enfriamiento.");
+        } else {
+          if (!result.challengeId || !result.sandboxCode) throw new Error("El servidor no devolvió un desafío de enrolamiento válido");
+          setDeviceEnrollmentChallengeId(result.challengeId);
+          setDeviceEnrollmentSandboxCode(result.sandboxCode);
+          toast.message("Código OTP generado para verificar este dispositivo.");
+        }
       }
       await utils.security.overview.invalidate();
     },
