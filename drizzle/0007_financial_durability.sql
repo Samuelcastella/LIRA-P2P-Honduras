@@ -50,6 +50,7 @@ SELECT `transferId`, CONCAT('MIG-', `transferId`), `transferId`, 'transfer_settl
 FROM `ledger_entries`
 GROUP BY `transferId`;--> statement-breakpoint
 UPDATE `ledger_entries` SET `journalId` = `transferId` WHERE `journalId` IS NULL;--> statement-breakpoint
+UPDATE `transfers` SET `settlementJournalId` = `id` WHERE `status` IN ('settled','reversed') AND `settlementJournalId` IS NULL AND EXISTS (SELECT 1 FROM `ledger_entries` WHERE `ledger_entries`.`transferId` = `transfers`.`id`);--> statement-breakpoint
 ALTER TABLE `ledger_entries` MODIFY COLUMN `journalId` varchar(36) NOT NULL;--> statement-breakpoint
 ALTER TABLE `ledger_entries` MODIFY COLUMN `transferId` varchar(36);--> statement-breakpoint
 ALTER TABLE `ledger_entries` DROP INDEX `ledger_transfer_account_direction_unique`;--> statement-breakpoint
