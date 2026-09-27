@@ -35,8 +35,16 @@ jobs:
         run: |
           rm -rf /tmp/lira-hardened
           unzip -q lira-p2p-honduras-hardened-v2.zip -d /tmp/lira-hardened
+          echo "--- hardened security router ---"
+          sed -n '1,180p' /tmp/lira-hardened/server/routers.ts
+          echo "--- hardened device enrollment implementation ---"
+          sed -n '330,425p' /tmp/lira-hardened/server/db.ts
+          echo "--- hardened payment request implementation ---"
+          sed -n '910,970p' /tmp/lira-hardened/server/db.ts
+          echo "--- archived client security mutations/flow ---"
+          sed -n '160,280p' /tmp/lira-hardened/client/src/pages/Home.tsx
           echo "--- hardened contract matches ---"
-          grep -RInE "enroll[A-Za-z]*Device|trusted.?device|startTransferVerification|createPaymentRequest" /tmp/lira-hardened/server /tmp/lira-hardened/client 2>/dev/null | head -n 160 || true
+          grep -RInE "enroll|device.*trust|trust.*device|cooling|eligibleAt|startTransferVerification|createPaymentRequest" /tmp/lira-hardened/server /tmp/lira-hardened/client 2>/dev/null | head -n 240 || true
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
