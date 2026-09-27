@@ -38,6 +38,7 @@
     "device-trust-and-OTP-parity-verified",
     "worker-and-reconciliation-entrypoints-verified",
     "canonical-service-entrypoints-and-builds-verified",
+    "canonical-deployment-artifacts-verified",
     "rollback-runbook-verified",
     "incident-response-runbook-verified",
     "observability-baseline-verified",
@@ -60,7 +61,8 @@
     "backup-recovery-point-verified": "blocked",
     "restore-drill-verified": "blocked",
     "all-CI-gates-green": "verified",
-    "production-postgres-major-verified": "verified"
+    "production-postgres-major-verified": "verified",
+    "canonical-deployment-artifacts-verified": "pending"
   },
   "semanticParityFiles": [
     "server/security/domain.ts",
