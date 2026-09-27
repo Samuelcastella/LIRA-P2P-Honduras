@@ -31,6 +31,22 @@
         "Dockerfile.api",
         ".dockerignore",
         "lira-p2p-honduras-hardened-v2.zip"
+      ],
+      "canonicalCandidateDockerfile": "Dockerfile.api.canonical",
+      "canonicalWatchPatterns": [
+        "Dockerfile.api.canonical",
+        "services/api/**",
+        "db/**",
+        "scripts/**",
+        "server/**",
+        "shared/**",
+        "drizzle/**",
+        "package.json",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+        "patches/**",
+        "tsconfig.json",
+        "drizzle.config.ts"
       ]
     },
     "lira-worker": {
@@ -40,6 +56,20 @@
         "Dockerfile.worker",
         ".dockerignore",
         "lira-p2p-honduras-hardened-v2.zip"
+      ],
+      "canonicalCandidateDockerfile": "Dockerfile.worker.canonical",
+      "canonicalWatchPatterns": [
+        "Dockerfile.worker.canonical",
+        "services/worker/**",
+        "server/**",
+        "shared/**",
+        "drizzle/**",
+        "package.json",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+        "patches/**",
+        "tsconfig.json",
+        "drizzle.config.ts"
       ]
     },
     "lira-reconciliation": {
@@ -49,6 +79,20 @@
         "Dockerfile.reconciliation",
         ".dockerignore",
         "lira-p2p-honduras-hardened-v2.zip"
+      ],
+      "canonicalCandidateDockerfile": "Dockerfile.reconciliation.canonical",
+      "canonicalWatchPatterns": [
+        "Dockerfile.reconciliation.canonical",
+        "services/reconciliation/**",
+        "server/**",
+        "shared/**",
+        "drizzle/**",
+        "package.json",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+        "patches/**",
+        "tsconfig.json",
+        "drizzle.config.ts"
       ]
     }
   }
