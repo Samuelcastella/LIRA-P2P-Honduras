@@ -85,7 +85,15 @@ jobs:
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 10.4.1
+          # Must NOT hardcode a version here: this repo's own root
+          # package.json (still present alongside the just-extracted
+          # hardened/ dir) declares packageManager pnpm@10.15.1, and
+          # pnpm/action-setup refuses to run if a hardcoded `version` input
+          # conflicts with any packageManager field it can see. Pointing it
+          # at the archive's own package.json (pnpm@10.4.1) instead of the
+          # root's avoids that conflict and installs the version this
+          # archive actually expects.
+          package_json_file: hardened/package.json
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
