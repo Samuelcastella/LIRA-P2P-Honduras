@@ -31,12 +31,13 @@ async function writeSecurityAudit(db: any, params: {
   resource: string;
   resourceId: string;
   requestId: string;
+  actorType?: "user" | "system";
   metadata?: Record<string, unknown>;
 }) {
   await db.insert(auditEvents).values({
     id: crypto.randomUUID(),
     actorUserId: params.userId,
-    actorType: "user",
+    actorType: params.actorType ?? "user",
     action: params.action,
     resource: params.resource,
     resourceId: params.resourceId,
@@ -75,6 +76,7 @@ async function ensureTrustContext(tx: any, userId: number, context: SecurityClie
         resource: "trusted_device",
         resourceId: device.id,
         requestId: device.id,
+        actorType: "system",
         metadata: { status: "new", sandbox: true },
       });
     }
@@ -148,6 +150,7 @@ async function issueChallenge(tx: any, userId: number, sessionId: string, purpos
     resource: "otp_challenge",
     resourceId: id,
     requestId: id,
+    actorType: "system",
     metadata: { purpose, expiresAt: expiresAt.toISOString(), sandbox: true },
   });
   return { challengeId: id, expiresAt, sandboxCode: code };
@@ -172,7 +175,7 @@ async function verifyChallengeWithPin(
   if (!verifySecret(pin, profile.pinHash)) {
     const next = nextPinFailureState(profile.failedPinAttempts);
     await tx.update(userSecurityProfiles).set({ ...next, updatedAt: new Date() }).where(eq(userSecurityProfiles.userId, userId));
-    throw new Error(next.lockedUntil ? "PIN bloqueado durante 15 minutos por intentos fallidos" : "PIN incorrecto");
+    return { ok: false as const, message: next.lockedUntil ? "PIN bloqueado durante 15 minutos por intentos fallidos" : "PIN incorrecto" };
   }
 
   const [challenge] = await tx.select().from(otpChallenges).where(and(
@@ -186,7 +189,7 @@ async function verifyChallengeWithPin(
     if (challenge.status === "issued") {
       await tx.update(otpChallenges).set({ status: "expired" }).where(eq(otpChallenges.id, challenge.id));
     }
-    throw new Error("El código expiró o ya fue usado; solicita uno nuevo");
+    return { ok: false as const, message: "El código expiró o ya fue usado; solicita uno nuevo" };
   }
   if (!verifySecret(code, challenge.codeHash)) {
     const attempts = challenge.attempts + 1;
@@ -194,15 +197,18 @@ async function verifyChallengeWithPin(
       attempts,
       status: attempts >= SANDBOX_SECURITY_POLICY.maxOtpAttempts ? "locked" : "issued",
     }).where(eq(otpChallenges.id, challenge.id));
-    throw new Error(attempts >= SANDBOX_SECURITY_POLICY.maxOtpAttempts
-      ? "Código bloqueado por demasiados intentos"
-      : "Código de verificación incorrecto");
+    return {
+      ok: false as const,
+      message: attempts >= SANDBOX_SECURITY_POLICY.maxOtpAttempts
+        ? "Código bloqueado por demasiados intentos"
+        : "Código de verificación incorrecto",
+    };
   }
 
   await tx.update(userSecurityProfiles).set({ failedPinAttempts: 0, lockedUntil: null, updatedAt: new Date() }).where(eq(userSecurityProfiles.userId, userId));
   await tx.update(otpChallenges).set({ status: "verified", verifiedAt: new Date() }).where(eq(otpChallenges.id, challenge.id));
   await tx.update(securitySessions).set({ authStrength: "strong", updatedAt: new Date() }).where(eq(securitySessions.id, sessionId));
-  return challenge;
+  return { ok: true as const, challenge };
 }
 
 export async function getCurrentDeviceTrust(userId: number, context: SecurityClientContext) {
@@ -247,6 +253,9 @@ export async function startDeviceEnrollment(userId: number, context: SecurityCli
     const current = await ensureTrustContext(tx, userId, context);
     if (current.device.status === "trusted") {
       return { alreadyTrusted: true as const, deviceId: current.device.id };
+    }
+    if (current.device.status === "restricted") {
+      throw new Error("Este dispositivo está restringido y no puede autoactivarse; requiere revisión administrativa");
     }
     const [profile] = await tx.select().from(userSecurityProfiles).where(eq(userSecurityProfiles.userId, userId)).limit(1);
     if (!profile?.pinHash) throw new Error("Configura tu PIN antes de verificar este dispositivo");
@@ -300,13 +309,21 @@ export async function verifyDeviceEnrollment(
   code: string,
 ) {
   const db = requiredDb(await getDb());
-  return db.transaction(async (tx) => {
+  const outcome = await db.transaction(async (tx) => {
     const current = await ensureTrustContext(tx, userId, context);
-    if (current.device.status === "trusted") return { success: true, alreadyTrusted: true } as const;
+    if (current.device.status === "trusted") {
+      return { ok: true as const, value: { success: true, alreadyTrusted: true } as const };
+    }
+    if (current.device.status === "restricted") {
+      throw new Error("Este dispositivo está restringido y requiere revisión administrativa");
+    }
     if (current.device.status !== "pending") throw new Error("El dispositivo no tiene una verificación pendiente");
     assertDeviceEligibleForTrust(current.device.eligibleAt);
 
-    const challenge = await verifyChallengeWithPin(tx, userId, current.session.id, challengeId, "device_enrollment", pin, code);
+    const verification = await verifyChallengeWithPin(tx, userId, current.session.id, challengeId, "device_enrollment", pin, code);
+    if (!verification.ok) return verification;
+
+    const challenge = verification.challenge;
     await tx.update(otpChallenges).set({ status: "consumed", consumedAt: new Date() }).where(eq(otpChallenges.id, challenge.id));
     await tx.update(trustedDevices).set({
       status: "trusted",
@@ -322,6 +339,9 @@ export async function verifyDeviceEnrollment(
       requestId: challenge.id,
       metadata: { method: "pin+otp+cooling_period" },
     });
-    return { success: true, alreadyTrusted: false } as const;
+    return { ok: true as const, value: { success: true, alreadyTrusted: false } as const };
   });
+
+  if (!outcome.ok) throw new Error(outcome.message);
+  return outcome.value;
 }
