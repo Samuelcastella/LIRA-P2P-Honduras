@@ -16,7 +16,7 @@ The root backend is **not yet authorized to replace** the archive-backed API, wo
 | Sandbox-only / real money disabled | Required | Required | aligned |
 | Currency model | HNL integer minor units | HNL integer minor units | aligned |
 | OAuth callback + state/nonce CSRF contract | hardened source | exact-parity source | aligned |
-| Security policy constants | hardened source | exact-parity source | aligned |
+| Security policy / device trust primitives | hardened source | semantically compatible and intentionally stricter | aligned with canonical hardening |
 | Ledger / idempotency / audit / reconciliation concepts | present | present | semantic parity gate |
 | Trusted-device lifecycle | baseline implementation | hardened further with persisted failure counters, restricted-device protection, deferred enrollment OTP | canonical is stricter |
 | Provider abstraction / signed webhooks / unknown state | present | present | semantic parity gate |
@@ -41,7 +41,7 @@ This decision is architectural and must not be hidden inside a Dockerfile edit.
 - sandbox-only deployment while reconciliation is incomplete;
 - archive-backed API/worker/reconciliation services while `canonicalBackendMigrationReady=false`;
 - detected versus declared database dialects;
-- exact parity for the security policy and OAuth callback contract;
+- exact parity for the OAuth callback contract and semantic parity for the security/financial domains;
 - presence of the critical ledger, idempotency, provider, webhook, outbox, reconciliation, payment-request, audit, and device-trust contracts in both representations;
 - canonical trusted-device safeguards that are intentionally stricter than the old baseline.
 
