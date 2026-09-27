@@ -4,7 +4,7 @@ WORKDIR /workspace
 ENV COREPACK_HOME=/tmp/corepack
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
- && corepack enable && corepack prepare pnpm@10.4.1 --activate
+ && corepack enable && corepack prepare pnpm@10.15.1 --activate
 
 COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
