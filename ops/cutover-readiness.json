@@ -1,0 +1,93 @@
+{
+  "version": 1,
+  "targetEnvironment": "production",
+  "mode": "sandbox",
+  "realMoneyEnabled": false,
+  "productionBaseline": {
+    "observedAt": "2026-09-27",
+    "artifactSource": "lira-p2p-honduras-hardened-v2.zip",
+    "railwayProjectId": "ece4ee7f-f271-435d-b93f-bf09a3b5955a",
+    "railwayEnvironmentId": "1b9d75d3-c6ff-43fa-b9a9-9c89962be710",
+    "services": {
+      "lira-api": {
+        "serviceId": "633b7001-fbfc-4004-b95d-0eb5c9b25bd8",
+        "dockerfile": "Dockerfile.api",
+        "healthcheckPath": "/ready"
+      },
+      "lira-worker": {
+        "serviceId": "10c9263f-c5e9-4d6b-af71-3d7f8b576d75",
+        "dockerfile": "Dockerfile.worker",
+        "healthcheckPath": "/health"
+      },
+      "lira-reconciliation": {
+        "serviceId": "86e8759c-4e43-49f6-b6fe-0ef7f685a26f",
+        "dockerfile": "Dockerfile.reconciliation",
+        "healthcheckPath": "/health"
+      }
+    },
+    "database": {
+      "serviceId": "b45ef3d3-9eb8-4203-bd41-188d1acc3b47",
+      "engine": "postgresql",
+      "volumeId": "a08417d9-badf-4a46-bb2b-f42a1e88cc73"
+    }
+  },
+  "gates": {
+    "mainCiGreen": {
+      "status": "verified",
+      "evidence": "GitHub Actions main run #88: sandbox source, canonical PostgreSQL, and hardened PostgreSQL jobs all passed."
+    },
+    "canonicalPostgres": {
+      "status": "verified",
+      "evidence": "Canonical migrations, checksum idempotency, fail-closed control, audit immutability, ledger immutability, balanced journals, tests, and builds run against PostgreSQL 16."
+    },
+    "workerReconciliationParity": {
+      "status": "verified",
+      "evidence": "Canonical retry/backoff/dead-letter and stale reconciliation escalation are integration-tested against PostgreSQL 16."
+    },
+    "serviceTopology": {
+      "status": "verified",
+      "evidence": "Independent API, worker, and reconciliation entrypoints build in CI."
+    },
+    "healthcheckCompatibility": {
+      "status": "verified",
+      "evidence": "Canonical API exposes /ready and /healthz; worker and reconciliation expose /health and /healthz."
+    },
+    "authContractParity": {
+      "status": "verified",
+      "evidence": "Exact OAuth/shared contract parity and API compatibility gates run in CI."
+    },
+    "deviceTrustOtpParity": {
+      "status": "verified",
+      "evidence": "Canonical security contract gates and security unit tests pass; device/session/OTP ownership and purpose separation remain enforced."
+    },
+    "rollbackRunbook": {
+      "status": "verified",
+      "evidence": "docs/runbooks/canonical-backend-cutover.md defines service-by-service rollback to the hardened artifact."
+    },
+    "incidentResponseRunbook": {
+      "status": "verified",
+      "evidence": "docs/runbooks/incident-response.md defines severity, containment, evidence preservation, and recovery."
+    },
+    "observabilityBaseline": {
+      "status": "verified",
+      "evidence": "Canonical services expose sanitized health state and structured operational events/counters for dispatch and reconciliation."
+    },
+    "backupRecoveryPoint": {
+      "status": "blocked",
+      "evidence": "A PostgreSQL volume exists, but an exact recent recoverable backup/PITR recovery point has not been independently verified through the available read-only tools."
+    },
+    "restoreVerification": {
+      "status": "blocked",
+      "evidence": "No disposable restore test has yet proven recovery from the production backup source."
+    }
+  },
+  "cutover": {
+    "status": "blocked",
+    "reason": "Do not switch backend Dockerfiles/artifact sources until backupRecoveryPoint and restoreVerification are verified.",
+    "order": [
+      "lira-api",
+      "lira-worker",
+      "lira-reconciliation"
+    ]
+  }
+}
