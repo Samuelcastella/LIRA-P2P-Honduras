@@ -14,7 +14,58 @@ if (contract.principles?.independentDeployUnits !== true) {
   fail("services must remain independent deployment units");
 }
 
-const web = read("Dockerfile.web");
+function dockerInstructions(source) {
+  return source
+    .replace(/\\\r?\n\s*/g, " ")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"));
+}
+
+function copySources(source) {
+  const result = [];
+  for (const instruction of dockerInstructions(source)) {
+    if (!/^COPY\s+/i.test(instruction)) continue;
+    let rest = instruction.replace(/^COPY\s+/i, "");
+    let fromStage = false;
+
+    while (rest.startsWith("--")) {
+      const match = rest.match(/^(--[^\s]+)\s+(.*)$/);
+      if (!match) break;
+      if (match[1].startsWith("--from=")) fromStage = true;
+      rest = match[2];
+    }
+    if (fromStage) continue;
+
+    if (rest.startsWith("[")) {
+      try {
+        const values = JSON.parse(rest);
+        if (!Array.isArray(values) || values.length < 2 || values.some((value) => typeof value !== "string")) {
+          fail(`invalid JSON COPY instruction: ${instruction}`);
+          continue;
+        }
+        result.push(...values.slice(0, -1));
+      } catch {
+        fail(`invalid JSON COPY instruction: ${instruction}`);
+      }
+      continue;
+    }
+
+    const tokens = rest.match(/"[^"]*"|'[^']*'|\S+/g)?.map((token) => token.replace(/^["']|["']$/g, "")) ?? [];
+    if (tokens.length < 2) {
+      fail(`unable to parse COPY instruction: ${instruction}`);
+      continue;
+    }
+    result.push(...tokens.slice(0, -1));
+  }
+  return result;
+}
+
+const webService = contract.services?.["lira-web"];
+if (!webService || webService.dockerfile !== "Dockerfile.web" || webService.artifactSource !== "canonical-repository") {
+  fail("lira-web must declare Dockerfile.web and canonical-repository as its build source");
+}
+const web = read(webService?.dockerfile ?? "Dockerfile.web");
 for (const required of ["pnpm-workspace.yaml", "COPY patches ./patches", "pnpm install --frozen-lockfile", "pnpm exec vite build"]) {
   if (!web.includes(required)) fail(`Dockerfile.web is missing required build input/step: ${required}`);
 }
@@ -27,29 +78,56 @@ for (const requiredBeforeInstall of ["pnpm-workspace.yaml", "COPY patches ./patc
   if (at === -1 || at > installAt) fail(`${requiredBeforeInstall} must be available before frozen install`);
 }
 
-for (const [service, dockerfile] of [
-  ["lira-api", "Dockerfile.api"],
-  ["lira-worker", "Dockerfile.worker"],
-  ["lira-reconciliation", "Dockerfile.reconciliation"],
-]) {
-  const docker = read(dockerfile);
-  if (!docker.includes("COPY lira-p2p-honduras-hardened-v2.zip /tmp/lira.zip")) {
-    fail(`${service} must build from the hardened archive until its source migration is explicitly completed`);
+const archiveServices = ["lira-api", "lira-worker", "lira-reconciliation"];
+for (const service of archiveServices) {
+  const serviceContract = contract.services?.[service];
+  if (!serviceContract?.dockerfile || !serviceContract?.artifactSource) {
+    fail(`${service} must declare dockerfile and artifactSource`);
+    continue;
   }
-  if (/COPY\s+(?:client|server|package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml)(?:\s|$)/m.test(docker)) {
-    fail(`${service} must not silently depend on canonical root/frontend files while archive-backed`);
+  if (!fs.existsSync(serviceContract.dockerfile)) {
+    fail(`${service} declares missing Dockerfile: ${serviceContract.dockerfile}`);
+    continue;
+  }
+  if (!fs.existsSync(serviceContract.artifactSource)) {
+    fail(`${service} declares missing artifact: ${serviceContract.artifactSource}`);
+  }
+
+  const docker = read(serviceContract.dockerfile);
+  const sources = copySources(docker);
+  if (!sources.includes(serviceContract.artifactSource)) {
+    fail(`${service} must copy its declared archive source ${serviceContract.artifactSource}`);
+  }
+  const unexpected = sources.filter((source) => source !== serviceContract.artifactSource);
+  if (unexpected.length) {
+    fail(`${service} archive-backed Dockerfile has undeclared build-context COPY source(s): ${unexpected.join(", ")}`);
   }
 }
 
-const expected = {
-  "lira-api": ["Dockerfile.api", "lira-p2p-honduras-hardened-v2.zip"],
-  "lira-worker": ["Dockerfile.worker", "lira-p2p-honduras-hardened-v2.zip"],
-  "lira-reconciliation": ["Dockerfile.reconciliation", "lira-p2p-honduras-hardened-v2.zip"],
+const expectedWatchPatterns = {
+  "lira-web": [
+    "client/**",
+    "shared/**",
+    "apps/web/**",
+    "Dockerfile.web",
+    "package.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    "patches/**",
+    "tsconfig.json",
+    "vite.config.ts",
+    "components.json",
+  ],
+  ...Object.fromEntries(archiveServices.map((service) => {
+    const serviceContract = contract.services?.[service] ?? {};
+    return [service, [serviceContract.dockerfile, serviceContract.artifactSource]];
+  })),
 };
-for (const [service, patterns] of Object.entries(expected)) {
+
+for (const [service, patterns] of Object.entries(expectedWatchPatterns)) {
   const actual = contract.services?.[service]?.watchPatterns;
   if (JSON.stringify(actual) !== JSON.stringify(patterns)) {
-    fail(`${service} watchPatterns drifted from its real build inputs`);
+    fail(`${service} watchPatterns drifted from its complete build-input contract`);
   }
 }
 
