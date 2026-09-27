@@ -82,25 +82,24 @@ jobs:
       - name: Extract hardened source archive
         run: unzip -q lira-p2p-honduras-hardened-v2.zip -d hardened
 
-      - name: Set up pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          # Must NOT hardcode a version here: this repo's own root
-          # package.json (still present alongside the just-extracted
-          # hardened/ dir) declares packageManager pnpm@10.15.1, and
-          # pnpm/action-setup refuses to run if a hardcoded `version` input
-          # conflicts with any packageManager field it can see. Pointing it
-          # at the archive's own package.json (pnpm@10.4.1) instead of the
-          # root's avoids that conflict and installs the version this
-          # archive actually expects.
-          package_json_file: hardened/package.json
-
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: pnpm
-          cache-dependency-path: hardened/pnpm-lock.yaml
+
+      - name: Set up pnpm via corepack
+        # Deliberately not pnpm/action-setup: with two package.json files in
+        # play (this repo's root, still pnpm@10.15.1, and the just-extracted
+        # hardened/package.json, pnpm@10.4.1), that action either refuses to
+        # run (version conflict) or ends up resolving/executing the wrong
+        # one depending on caching, which is exactly what broke this job
+        # twice already (see the two preceding commits). corepack, run
+        # directly, is what Dockerfile.api/.worker/.reconciliation already
+        # use successfully in production — same mechanism, proven to work.
+        working-directory: hardened
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.4.1 --activate
 
       - name: Install dependencies
         working-directory: hardened
