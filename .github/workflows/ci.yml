@@ -46,8 +46,8 @@ jobs:
           sed -n '1,180p' /tmp/lira-hardened/server/routers.ts
           echo "--- hardened device enrollment implementation ---"
           sed -n '330,425p' /tmp/lira-hardened/server/db.ts
-          echo "--- hardened payment request implementation ---"
-          sed -n '910,970p' /tmp/lira-hardened/server/db.ts
+          echo "--- hardened reconciliation and payment request implementation ---"
+          sed -n '780,970p' /tmp/lira-hardened/server/db.ts
           echo "--- archived client security mutations/flow ---"
           sed -n '160,300p' /tmp/lira-hardened/client/src/pages/Home.tsx
           echo "--- hardened OAuth server contract ---"
