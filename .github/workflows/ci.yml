@@ -34,6 +34,9 @@ jobs:
       - name: Validate canonical backend reconciliation gate
         run: node scripts/validate-backend-reconciliation.mjs
 
+      - name: Validate production cutover readiness gate
+        run: node scripts/validate-cutover-readiness.mjs
+
       - name: Inspect hardened API security and auth contracts
         run: |
           rm -rf /tmp/lira-hardened
