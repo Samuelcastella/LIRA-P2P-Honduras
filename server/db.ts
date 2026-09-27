@@ -469,7 +469,7 @@ export async function ensureSandboxWorkspace(userId: number) {
       currency: "HNL",
       idempotencyKey: seedKey,
     };
-    const entries = createBalancedJournal(seedTransferId, seedIntent);
+    const entries = createBalancedJournal(seedTransferId, seedTransferId, seedIntent);
     assertBalancedJournal(entries);
     await tx.insert(transfers).values({
       id: seedTransferId,
@@ -693,7 +693,7 @@ export async function processVerifiedProviderWebhook(webhook: ProviderWebhook, p
 
     if (webhook.type === "transfer.settled" && transfer.status === "processing") {
       const intent: TransferIntent = { senderUserId: transfer.senderUserId, recipientHandle: transfer.recipientHandle, sourceAccountId: transfer.sourceAccountId, destinationAccountId: transfer.destinationAccountId, amountMinor: transfer.amountMinor, currency: "HNL", idempotencyKey: transfer.idempotencyKey };
-      const entries = createBalancedJournal(transfer.id, intent);
+      const entries = createBalancedJournal(transfer.id, transfer.id, intent);
       assertBalancedJournal(entries);
       assertAllowedTransition("processing", "settled");
       await tx.insert(ledgerEntries).values(entries);
