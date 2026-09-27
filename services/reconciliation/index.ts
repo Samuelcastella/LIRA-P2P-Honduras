@@ -45,8 +45,9 @@ async function tick() {
 const healthPort = Number(process.env.PORT ?? 3000);
 if (!Number.isInteger(healthPort) || healthPort <= 0 || healthPort > 65535) throw new Error(`Invalid PORT: ${process.env.PORT ?? ""}`);
 
+const healthPaths = new Set(["/healthz", "/health"]);
 const healthServer = createServer((req, res) => {
-  if (req.url !== "/healthz") {
+  if (!healthPaths.has(req.url ?? "")) {
     res.statusCode = 404;
     res.end("not found");
     return;
