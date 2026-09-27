@@ -14,6 +14,7 @@
         "shared/**",
         "apps/web/**",
         "Dockerfile.web",
+        ".dockerignore",
         "package.json",
         "pnpm-lock.yaml",
         "pnpm-workspace.yaml",
@@ -28,6 +29,7 @@
       "artifactSource": "lira-p2p-honduras-hardened-v2.zip",
       "watchPatterns": [
         "Dockerfile.api",
+        ".dockerignore",
         "lira-p2p-honduras-hardened-v2.zip"
       ]
     },
@@ -36,6 +38,7 @@
       "artifactSource": "lira-p2p-honduras-hardened-v2.zip",
       "watchPatterns": [
         "Dockerfile.worker",
+        ".dockerignore",
         "lira-p2p-honduras-hardened-v2.zip"
       ]
     },
@@ -44,6 +47,7 @@
       "artifactSource": "lira-p2p-honduras-hardened-v2.zip",
       "watchPatterns": [
         "Dockerfile.reconciliation",
+        ".dockerignore",
         "lira-p2p-honduras-hardened-v2.zip"
       ]
     }
