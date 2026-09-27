@@ -51,7 +51,7 @@ type Transfer = {
   amount: number;
   type: TransactionType;
   time: string;
-  status: "Completado" | "Pendiente" | "Verificando" | "Rechazado" | "Expirado" | "Fallido" | "Cancelado" | "Solicitado";
+  status: "Completado" | "Pendiente" | "Verificando" | "Confirmando" | "Rechazado" | "Expirado" | "Fallido" | "Cancelado" | "Solicitado";
   icon: string;
   color: string;
 };
@@ -81,6 +81,7 @@ const formatMoney = (value: number) =>
 
 const statusFromApi = (status: string): Transfer["status"] => {
   if (status === "settled") return "Completado";
+  if (status === "unknown") return "Confirmando";
   if (status === "processing" || status === "authorized") return "Pendiente";
   if (status === "created" || status === "authenticating" || status === "risk_review") return "Verificando";
   if (status === "declined") return "Rechazado";
@@ -129,7 +130,7 @@ function Avatar({ initials, color = "mint", size = "md" }: { initials: string; c
 
 function StatusPill({ status }: { status: Transfer["status"] }) {
   const isDone = status === "Completado";
-  const isProgress = status === "Pendiente" || status === "Verificando";
+  const isProgress = status === "Pendiente" || status === "Verificando" || status === "Confirmando";
   const isAlert = status === "Rechazado" || status === "Fallido" || status === "Expirado" || status === "Cancelado";
   return (
     <span className={`status-pill ${isDone ? "status-complete" : isProgress ? "status-progress" : isAlert ? "status-alert" : "status-request"}`}>
@@ -185,7 +186,7 @@ export default function Home() {
   const balance = dashboardQuery.data ? dashboardQuery.data.balanceMinor / 100 : 3250;
   const incomingTotal = transfers.filter((transfer) => transfer.type === "in").reduce((total, transfer) => total + transfer.amount, 0);
   const outgoingTotal = transfers.filter((transfer) => transfer.type === "out").reduce((total, transfer) => total + transfer.amount, 0);
-  const attentionTransfers = transfers.filter((transfer) => ["Pendiente", "Verificando", "Rechazado", "Expirado", "Fallido", "Cancelado"].includes(transfer.status));
+  const attentionTransfers = transfers.filter((transfer) => ["Pendiente", "Verificando", "Confirmando", "Rechazado", "Expirado", "Fallido", "Cancelado"].includes(transfer.status));
   const filteredContacts = useMemo(
     () => contacts.filter((contact) => `${contact.name} ${contact.handle}`.toLowerCase().includes(recipientSearch.toLowerCase())),
     [recipientSearch],
