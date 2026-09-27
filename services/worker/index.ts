@@ -47,13 +47,16 @@ async function tick() {
     counters.unknown += result.unknown;
     counters.deadLettered += result.deadLettered;
 
-    operationalLog("lira-worker", "dispatch_cycle_completed", {
-      durationMs: Date.now() - startedAt,
-      dispatched: result.dispatched,
-      unknown: result.unknown,
-      deadLettered: result.deadLettered,
-      cycles: counters.cycles,
-    }, result.deadLettered > 0 ? "warn" : "info");
+    const shouldLogCycle = result.dispatched > 0 || result.unknown > 0 || result.deadLettered > 0 || counters.cycles % 12 === 0;
+    if (shouldLogCycle) {
+      operationalLog("lira-worker", "dispatch_cycle_completed", {
+        durationMs: Date.now() - startedAt,
+        dispatched: result.dispatched,
+        unknown: result.unknown,
+        deadLettered: result.deadLettered,
+        cycles: counters.cycles,
+      }, result.deadLettered > 0 ? "warn" : "info");
+    }
   } catch (error) {
     consecutiveFailures += 1;
     counters.tickFailures += 1;
