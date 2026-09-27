@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "targetEnvironment": "production",
   "mode": "sandbox",
   "realMoneyEnabled": false,
@@ -28,7 +28,8 @@
     "database": {
       "serviceId": "b45ef3d3-9eb8-4203-bd41-188d1acc3b47",
       "engine": "postgresql",
-      "volumeId": "a08417d9-badf-4a46-bb2b-f42a1e88cc73"
+      "volumeId": "a08417d9-badf-4a46-bb2b-f42a1e88cc73",
+      "postgresMajor": 18
     }
   },
   "gates": {
@@ -39,6 +40,10 @@
     "canonicalPostgres": {
       "status": "verified",
       "evidence": "Canonical migrations, checksum idempotency, fail-closed control, audit immutability, ledger immutability, balanced journals, tests, and builds run against PostgreSQL 16."
+    },
+    "productionPostgresMajorParity": {
+      "status": "pending",
+      "evidence": "Production Railway Postgres uses major version 18. CI parity for canonical source and hardened rollback baseline on PostgreSQL 18 is being added."
     },
     "workerReconciliationParity": {
       "status": "verified",
