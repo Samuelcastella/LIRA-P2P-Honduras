@@ -42,8 +42,12 @@ jobs:
           sed -n '1,150p' /tmp/lira-hardened/server/security/domain.ts
           echo "--- hardened trusted device/session/otp schema ---"
           grep -n -A110 -B10 "trustedDevices\|trusted_devices" /tmp/lira-hardened/drizzle/schema.ts 2>/dev/null | head -n 180 || true
+          echo "--- hardened financial domain ---"
+          sed -n '1,260p' /tmp/lira-hardened/server/financial/domain.ts
+          echo "--- hardened provider contract ---"
+          sed -n '1,300p' /tmp/lira-hardened/server/financial/provider.ts
           echo "--- hardened transfer/outbox/reconciliation schema ---"
-          sed -n '190,390p' /tmp/lira-hardened/drizzle/schema.ts
+          sed -n '190,430p' /tmp/lira-hardened/drizzle/schema.ts
           echo "--- hardened security router ---"
           sed -n '1,180p' /tmp/lira-hardened/server/routers.ts
           echo "--- hardened device enrollment implementation ---"
