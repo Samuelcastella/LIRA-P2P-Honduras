@@ -40,6 +40,8 @@ jobs:
           unzip -q lira-p2p-honduras-hardened-v2.zip -d /tmp/lira-hardened
           echo "--- hardened security policy ---"
           sed -n '1,150p' /tmp/lira-hardened/server/security/domain.ts
+          echo "--- hardened schema enums and identity tables ---"
+          sed -n '1,190p' /tmp/lira-hardened/drizzle/schema.ts
           echo "--- hardened trusted device/session/otp schema ---"
           grep -n -A110 -B10 "trustedDevices\|trusted_devices" /tmp/lira-hardened/drizzle/schema.ts 2>/dev/null | head -n 180 || true
           echo "--- hardened financial domain ---"
