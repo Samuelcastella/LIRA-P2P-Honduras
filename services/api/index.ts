@@ -23,8 +23,9 @@ async function start() {
   const app = express();
   const server = createServer(app);
 
-  app.get("/healthz", (_req, res) => {
-    res.status(200).json({ service: "lira-api", status: "ok", mode: "sandbox" });
+  const healthPayload = { service: "lira-api", status: "ok", mode: "sandbox" } as const;
+  app.get(["/healthz", "/ready"], (_req, res) => {
+    res.status(200).json(healthPayload);
   });
 
   registerSandboxWebhook(app);

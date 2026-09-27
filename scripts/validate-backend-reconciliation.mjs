@@ -86,15 +86,15 @@ for (const [file, present] of Object.entries(canonicalServiceSourceFiles)) {
 
 if (fs.existsSync("services/api/index.ts")) {
   const source = read("services/api/index.ts");
-  requireTokens("canonical API entrypoint", source, ["/healthz", "SIGTERM", "LIRA_REAL_MONEY_ENABLED", "createExpressMiddleware"]);
+  requireTokens("canonical API entrypoint", source, ["/healthz", "/ready", "SIGTERM", "LIRA_REAL_MONEY_ENABLED", "createExpressMiddleware"]);
 }
 if (fs.existsSync("services/worker/index.ts")) {
   const source = read("services/worker/index.ts");
-  requireTokens("canonical worker entrypoint", source, ["dispatchPendingSandboxOutbox", "/healthz", "SIGTERM", "setInterval", "LIRA_REAL_MONEY_ENABLED"]);
+  requireTokens("canonical worker entrypoint", source, ["dispatchPendingSandboxOutbox", "/healthz", "/health", "SIGTERM", "setInterval", "LIRA_REAL_MONEY_ENABLED"]);
 }
 if (fs.existsSync("services/reconciliation/index.ts")) {
   const source = read("services/reconciliation/index.ts");
-  requireTokens("canonical reconciliation entrypoint", source, ["reconcilePendingSandboxTransfers", "/healthz", "SIGTERM", "setInterval", "LIRA_REAL_MONEY_ENABLED"]);
+  requireTokens("canonical reconciliation entrypoint", source, ["reconcilePendingSandboxTransfers", "/healthz", "/health", "SIGTERM", "setInterval", "LIRA_REAL_MONEY_ENABLED"]);
 }
 
 const rootSchema = read("drizzle/schema.ts");
