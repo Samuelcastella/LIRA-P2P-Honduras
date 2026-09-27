@@ -126,6 +126,7 @@ for (const service of backendServices) {
         : "services/reconciliation/**";
     const candidateRequiredPatterns = [
       candidateDockerfile,
+      ".dockerignore",
       serviceEntrypointPattern,
       "server/**",
       "shared/**",
