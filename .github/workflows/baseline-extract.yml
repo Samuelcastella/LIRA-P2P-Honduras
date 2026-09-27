@@ -1,0 +1,25 @@
+name: Baseline extraction evidence
+
+on:
+  push:
+    branches:
+      - chore/postgres-canonical
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Print hardened PostgreSQL sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in drizzle/schema.ts db/migrations/001_initial_postgres.sql db/migrations/002_audit_events_immutability.sql db/migrations/003_outbox_dead_letter.sql scripts/migrate.mjs package.json server/db.ts; do
+            echo "===== BEGIN $f ====="
+            unzip -p lira-p2p-honduras-hardened-v2.zip "$f"
+            echo
+            echo "===== END $f ====="
+          done
