@@ -31,7 +31,7 @@ async function tick() {
     const result = await dispatchPendingSandboxOutbox(batchSize);
     lastSuccessAt = new Date().toISOString();
     lastError = null;
-    if (result.dispatched || result.unknown || result.deadLettered) {
+    if (result.dispatched || result.unknown) {
       console.log("[lira-worker] dispatch cycle", result);
     }
   } catch (error) {
