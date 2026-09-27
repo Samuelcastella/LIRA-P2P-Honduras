@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "targetEnvironment": "production",
   "mode": "sandbox",
   "realMoneyEnabled": false,
@@ -52,6 +52,10 @@
     "serviceTopology": {
       "status": "verified",
       "evidence": "Independent API, worker, and reconciliation entrypoints build in CI."
+    },
+    "canonicalDeploymentArtifacts": {
+      "status": "pending",
+      "evidence": "Canonical alternate Dockerfiles and CI container builds are being prepared; current Railway production remains on hardened Dockerfiles."
     },
     "healthcheckCompatibility": {
       "status": "verified",
