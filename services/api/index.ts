@@ -1,12 +1,15 @@
 import "dotenv/config";
 import express from "express";
 import { createServer } from "node:http";
+import { sql } from "drizzle-orm";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { registerOAuthRoutes } from "../../server/_core/oauth";
 import { registerStorageProxy } from "../../server/_core/storageProxy";
 import { createContext } from "../../server/_core/context";
 import { appRouter } from "../../server/routers";
+import { closeDb, getDb } from "../../server/db";
 import { registerSandboxWebhook } from "../../server/financial/webhook";
+import { errorClass, operationalLog } from "../../server/observability";
 
 function assertSandboxRuntime() {
   if (process.env.LIRA_REAL_MONEY_ENABLED === "true") {
@@ -23,9 +26,23 @@ async function start() {
   const app = express();
   const server = createServer(app);
 
-  const healthPayload = { service: "lira-api", status: "ok", mode: "sandbox" } as const;
-  app.get(["/healthz", "/ready"], (_req, res) => {
-    res.status(200).json(healthPayload);
+  app.get("/healthz", (_req, res) => {
+    res.status(200).json({ service: "lira-api", status: "ok", mode: "sandbox" });
+  });
+
+  app.get("/ready", async (_req, res) => {
+    try {
+      const db = await getDb();
+      if (!db) {
+        res.status(503).json({ service: "lira-api", status: "not_ready", mode: "sandbox" });
+        return;
+      }
+      await db.execute(sql`select 1`);
+      res.status(200).json({ service: "lira-api", status: "ready", mode: "sandbox" });
+    } catch (error) {
+      operationalLog("lira-api", "readiness_check_failed", { errorClass: errorClass(error) }, "error");
+      res.status(503).json({ service: "lira-api", status: "not_ready", mode: "sandbox" });
+    }
   });
 
   registerSandboxWebhook(app);
@@ -46,17 +63,42 @@ async function start() {
     throw new Error(`Invalid PORT: ${process.env.PORT ?? ""}`);
   }
 
-  server.listen(port, "0.0.0.0", () => {
-    console.log(`[lira-api] listening on ${port} in sandbox mode`);
+  server.on("error", (error) => {
+    operationalLog("lira-api", "server_error", { errorClass: errorClass(error) }, "error");
+    process.exitCode = 1;
   });
 
+  server.listen(port, "0.0.0.0", () => {
+    operationalLog("lira-api", "service_started", { port, mode: "sandbox" });
+  });
+
+  let stopping = false;
   const shutdown = (signal: string) => {
-    console.log(`[lira-api] received ${signal}; shutting down`);
-    server.close((error) => {
-      if (error) {
-        console.error("[lira-api] shutdown failed", error);
-        process.exitCode = 1;
-      }
+    if (stopping) return;
+    stopping = true;
+    operationalLog("lira-api", "shutdown_started", { signal });
+
+    const forceExitTimer = setTimeout(() => {
+      operationalLog("lira-api", "shutdown_timeout", { signal }, "error");
+      process.exitCode = 1;
+    }, 10_000);
+    forceExitTimer.unref();
+
+    server.close((serverError) => {
+      void closeDb()
+        .catch((dbError) => {
+          operationalLog("lira-api", "database_shutdown_failed", { errorClass: errorClass(dbError) }, "error");
+          process.exitCode = 1;
+        })
+        .finally(() => {
+          clearTimeout(forceExitTimer);
+          if (serverError) {
+            operationalLog("lira-api", "server_shutdown_failed", { errorClass: errorClass(serverError) }, "error");
+            process.exitCode = 1;
+          } else {
+            operationalLog("lira-api", "shutdown_completed", { signal });
+          }
+        });
     });
   };
 
@@ -65,6 +107,6 @@ async function start() {
 }
 
 start().catch((error) => {
-  console.error("[lira-api] fatal startup error", error);
+  operationalLog("lira-api", "fatal_startup_error", { errorClass: errorClass(error) }, "error");
   process.exitCode = 1;
 });
