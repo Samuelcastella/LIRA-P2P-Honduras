@@ -108,6 +108,12 @@ jobs:
       - name: Build canonical backend service entrypoints
         run: pnpm build:api && pnpm build:worker && pnpm build:reconciliation
 
+      - name: Build canonical backend containers
+        run: |
+          docker build -f Dockerfile.api.canonical -t lira-api-canonical-ci .
+          docker build -f Dockerfile.worker.canonical -t lira-worker-canonical-ci .
+          docker build -f Dockerfile.reconciliation.canonical -t lira-reconciliation-canonical-ci .
+
       - name: Build lira-web container
         run: docker build -f Dockerfile.web -t lira-web-ci .
 
