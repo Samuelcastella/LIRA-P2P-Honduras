@@ -793,7 +793,7 @@ export async function getFinancialDashboard(userId: number) {
     accounts,
     recentTransfers,
     recentRisk,
-    transfersEnabled: controls[0]?.enabled !== 0,
+    transfersEnabled: controls[0]?.enabled !== false,
   };
 }
 
@@ -827,7 +827,7 @@ export async function createSandboxTransfer(userId: number, input: Omit<Transfer
 
   return db.transaction(async (tx) => {
     const [control] = await tx.select().from(operationalControls).where(eq(operationalControls.control, "transfers_enabled")).limit(1);
-    if (control?.enabled === 0) throw new Error("Transfers are temporarily paused by an operational control");
+    if (control?.enabled === false) throw new Error("Transfers are temporarily paused by an operational control");
 
     const [prior] = await tx.select().from(transfers).where(and(
       eq(transfers.senderUserId, userId),
@@ -843,7 +843,7 @@ export async function createSandboxTransfer(userId: number, input: Omit<Transfer
     await consumeVerifiedTransferChallenge(tx, userId, sessionFingerprint, verificationChallengeId);
 
     const recent = await tx.select({ count: sql<number>`count(*)` }).from(transfers)
-      .where(and(eq(transfers.senderUserId, userId), sql`${transfers.createdAt} > date_sub(now(), interval 5 minute)`));
+      .where(and(eq(transfers.senderUserId, userId), sql`${transfers.createdAt} > now() - interval '5 minutes'`));
     const risk = evaluateRisk({ amountMinor: intent.amountMinor, attemptsInFiveMinutes: Number(recent[0]?.count ?? 0) });
     const transferId = crypto.randomUUID();
     const reference = createTransferReference();
