@@ -9,6 +9,7 @@ import {
   getFinancialDashboard,
   getSecurityOverview,
   listAdminOperations,
+  reconcilePendingSandboxTransfers,
   revokeOtherSecuritySessions,
   revokeSecuritySession,
   revokeTrustedDevice,
@@ -194,6 +195,13 @@ export const appRouter = router({
     dispatchSandboxOutbox: adminProcedure.input(z.object({ limit: z.number().int().min(1).max(50).default(20) })).mutation(async ({ ctx, input }) => {
       try {
         return await dispatchPendingSandboxOutbox(input.limit);
+      } catch (error) {
+        return financialError(error);
+      }
+    }),
+    reconcileSandboxTransfers: adminProcedure.input(z.object({ limit: z.number().int().min(1).max(100).default(50) })).mutation(async ({ input }) => {
+      try {
+        return await reconcilePendingSandboxTransfers(input.limit);
       } catch (error) {
         return financialError(error);
       }
