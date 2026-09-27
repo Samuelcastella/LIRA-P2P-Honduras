@@ -54,8 +54,26 @@ jobs:
           echo "--- hardened contract matches ---"
           grep -RInE "enroll|device.*trust|trust.*device|cooling|eligibleAt|startTransferVerification|createPaymentRequest|oauth|app-auth|VITE_APP_ID|VITE_OAUTH" /tmp/lira-hardened/server /tmp/lira-hardened/client 2>/dev/null | head -n 360 || true
 
+      - name: Enforce API compatibility contract
+        run: |
+          grep -q 'return { request, replayed: false }' /tmp/lira-hardened/server/db.ts
+          grep -q 'return { request:' server/routers.ts
+          grep -q 'result.request.id' client/src/pages/Home.tsx
+          if grep -q 'result.paymentRequest' client/src/pages/Home.tsx; then
+            echo "Canonical client still consumes the obsolete paymentRequest response shape" >&2
+            exit 1
+          fi
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Verify Drizzle schema and migration snapshot stay synchronized
+        env:
+          DATABASE_URL: mysql://ci:ci@127.0.0.1:3306/ci
+        run: |
+          pnpm exec drizzle-kit generate --name ci_schema_sync
+          git diff --exit-code -- drizzle
+          test -z "$(git status --porcelain -- drizzle)"
 
       - name: Check types
         run: pnpm check
