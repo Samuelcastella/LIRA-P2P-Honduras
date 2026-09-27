@@ -103,7 +103,23 @@ jobs:
 
       - name: Install dependencies
         working-directory: hardened
-        run: pnpm install --no-frozen-lockfile
+        # --ignore-workspace is required, not optional: hardened/ has no
+        # pnpm-workspace.yaml of its own, and this checkout's repo root
+        # (one directory up) does — pnpm walks up from cwd looking for a
+        # workspace root and, finding the repo root's pnpm-workspace.yaml
+        # and .git, treats THAT as the workspace root even though cwd is
+        # hardened/. Without this flag pnpm installs against the outer
+        # root's pnpm-lock.yaml (which has no `pg`, since the canonical
+        # root tree uses mysql2, not pg) instead of hardened/'s own lockfile
+        # — exactly what caused the third failure of this job (ERR_MODULE_
+        # NOT_FOUND for 'pg' in scripts/migrate.mjs, despite a correct,
+        # freshly-downloaded pnpm@10.4.1 install of *something*). Confirmed
+        # by reproducing the exact nested-repo layout locally: without the
+        # flag, `pnpm install` looked for patches/wouter@3.7.1.patch at the
+        # OUTER root instead of hardened/patches/ — proving it had picked
+        # up the wrong workspace root. With the flag, install, migrate, and
+        # both verification scripts all pass in that same reproduction.
+        run: pnpm install --no-frozen-lockfile --ignore-workspace
 
       - name: Apply migrations to the CI database
         working-directory: hardened
