@@ -23,6 +23,7 @@ const mandatoryGates = [
   "productionPostgresMajorParity",
   "workerReconciliationParity",
   "serviceTopology",
+  "canonicalDeploymentArtifacts",
   "healthcheckCompatibility",
   "authContractParity",
   "deviceTrustOtpParity",
