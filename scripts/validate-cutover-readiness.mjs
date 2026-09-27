@@ -20,6 +20,7 @@ if (deployment.principles?.sandboxOnly !== true || deployment.principles?.realMo
 const mandatoryGates = [
   "mainCiGreen",
   "canonicalPostgres",
+  "productionPostgresMajorParity",
   "workerReconciliationParity",
   "serviceTopology",
   "healthcheckCompatibility",

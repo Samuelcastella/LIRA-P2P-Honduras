@@ -30,6 +30,7 @@
   ],
   "migrationExitCriteria": [
     "database-dialect-and-migration-strategy-reconciled",
+    "production-postgres-major-verified",
     "auth-contract-parity-verified",
     "financial-domain-invariants-verified",
     "provider-failure-semantics-verified",
@@ -58,7 +59,8 @@
     "observability-baseline-verified": "verified",
     "backup-recovery-point-verified": "blocked",
     "restore-drill-verified": "blocked",
-    "all-CI-gates-green": "verified"
+    "all-CI-gates-green": "verified",
+    "production-postgres-major-verified": "verified"
   },
   "semanticParityFiles": [
     "server/security/domain.ts",

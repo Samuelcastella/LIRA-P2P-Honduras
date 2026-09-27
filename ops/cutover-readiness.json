@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "targetEnvironment": "production",
   "mode": "sandbox",
   "realMoneyEnabled": false,
@@ -28,17 +28,22 @@
     "database": {
       "serviceId": "b45ef3d3-9eb8-4203-bd41-188d1acc3b47",
       "engine": "postgresql",
-      "volumeId": "a08417d9-badf-4a46-bb2b-f42a1e88cc73"
+      "volumeId": "a08417d9-badf-4a46-bb2b-f42a1e88cc73",
+      "postgresMajor": 18
     }
   },
   "gates": {
     "mainCiGreen": {
       "status": "verified",
-      "evidence": "GitHub Actions main run #88: sandbox source, canonical PostgreSQL, and hardened PostgreSQL jobs all passed."
+      "evidence": "GitHub Actions main run #97 passed sandbox source, canonical PostgreSQL, and hardened PostgreSQL jobs after operational-readiness merge."
     },
     "canonicalPostgres": {
       "status": "verified",
       "evidence": "Canonical migrations, checksum idempotency, fail-closed control, audit immutability, ledger immutability, balanced journals, tests, and builds run against PostgreSQL 16."
+    },
+    "productionPostgresMajorParity": {
+      "status": "verified",
+      "evidence": "GitHub Actions run #98 passed canonical and hardened rollback paths on PostgreSQL 16 and PostgreSQL 18; production Railway Postgres is major version 18."
     },
     "workerReconciliationParity": {
       "status": "verified",
