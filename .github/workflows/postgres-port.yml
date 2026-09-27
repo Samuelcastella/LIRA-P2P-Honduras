@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   port:
-    if: github.event.head_commit.message != 'chore: port canonical persistence to PostgreSQL'
+    if: ${{ github.event.head_commit.message != 'chore: port canonical persistence to PostgreSQL' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
