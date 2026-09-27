@@ -35,6 +35,7 @@
     "reconciliation-parity-verified",
     "device-trust-and-OTP-parity-verified",
     "worker-and-reconciliation-entrypoints-verified",
+    "canonical-service-entrypoints-and-builds-verified",
     "rollback-runbook-verified",
     "all-CI-gates-green"
   ],
@@ -44,5 +45,15 @@
     "server/financial/provider.ts",
     "server/db.ts",
     "drizzle/schema.ts"
-  ]
+  ],
+  "serviceTopology": {
+    "baseline": "independent-api-worker-reconciliation",
+    "canonical": "monolithic-server-only",
+    "status": "blocking",
+    "requiredCanonicalBuildScripts": [
+      "build:api",
+      "build:worker",
+      "build:reconciliation"
+    ]
+  }
 }
