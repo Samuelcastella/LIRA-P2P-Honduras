@@ -273,6 +273,9 @@ jobs:
           }
           NODE
 
+      - name: Verify canonical retry dead-letter and reconciliation escalation
+        run: pnpm exec tsx scripts/verify-canonical-worker-reconciliation.mts
+
       - name: Check types with PostgreSQL runtime configuration
         run: pnpm check
 
