@@ -60,7 +60,7 @@
     "backup-recovery-point-verified": "blocked",
     "restore-drill-verified": "blocked",
     "all-CI-gates-green": "verified",
-    "production-postgres-major-verified": "pending"
+    "production-postgres-major-verified": "verified"
   },
   "semanticParityFiles": [
     "server/security/domain.ts",
