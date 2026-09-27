@@ -41,6 +41,7 @@ import {
   assertSandboxTransferWithinSingleLimit,
   assertTrustedDeviceState,
   createOtpCode,
+  deviceTrustEligibleAt,
   hashSecret,
   isExpired,
   nextPinFailureState,
@@ -163,33 +164,63 @@ function currentUtcDayStart(now = new Date()) {
   return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
 }
 
-async function ensureSecurityContext(db: any, userId: number, context: SecurityClientContext) {
+async function ensureSecurityContext(
+  db: any,
+  userId: number,
+  context: SecurityClientContext,
+  options: { allowRestricted?: boolean } = {},
+) {
   const deviceFingerprintHash = securityFingerprint(context.deviceFingerprint);
   const sessionFingerprintHash = securityFingerprint(context.sessionFingerprint);
   let [device] = await db.select().from(trustedDevices).where(and(eq(trustedDevices.userId, userId), eq(trustedDevices.fingerprintHash, deviceFingerprintHash))).limit(1);
   if (!device) {
+    const requestedAt = new Date();
     const deviceId = crypto.randomUUID();
-    await db.insert(trustedDevices).values({ id: deviceId, userId, fingerprintHash: deviceFingerprintHash, label: context.deviceLabel, platform: context.platform });
+    await db.insert(trustedDevices).values({
+      id: deviceId,
+      userId,
+      fingerprintHash: deviceFingerprintHash,
+      label: context.deviceLabel,
+      platform: context.platform,
+      status: "new",
+      enrollmentRequestedAt: requestedAt,
+      eligibleAt: deviceTrustEligibleAt(requestedAt),
+    });
     [device] = await db.select().from(trustedDevices).where(eq(trustedDevices.id, deviceId)).limit(1);
+    if (device) {
+      await writeAudit(db, {
+        actorUserId: userId,
+        actorType: "system",
+        action: "trusted_device_discovered",
+        resource: "trusted_device",
+        resourceId: device.id,
+        requestId: device.id,
+        metadata: { status: "new", sandbox: true },
+      });
+    }
   }
   if (!device || device.revokedAt || device.status === "revoked") throw new Error("Este dispositivo fue revocado; usa un dispositivo de confianza para continuar");
-  await db.update(trustedDevices).set({ label: context.deviceLabel, platform: context.platform, lastUsedAt: new Date() }).where(eq(trustedDevices.id, device.id));
+  if (device.status === "restricted" && !options.allowRestricted) {
+    throw new Error("Este dispositivo está restringido y no puede realizar cambios de seguridad");
+  }
+  await db.update(trustedDevices).set({ label: context.deviceLabel, platform: context.platform, lastUsedAt: new Date(), updatedAt: new Date() }).where(eq(trustedDevices.id, device.id));
 
   let [session] = await db.select().from(securitySessions).where(and(eq(securitySessions.userId, userId), eq(securitySessions.sessionFingerprintHash, sessionFingerprintHash))).limit(1);
   if (!session) {
     const sessionId = crypto.randomUUID();
-    await db.insert(securitySessions).values({ id: sessionId, userId, deviceId: device.id, sessionFingerprintHash, label: context.deviceLabel });
+    await db.insert(securitySessions).values({ id: sessionId, userId, deviceId: device.id, sessionFingerprintHash, label: context.deviceLabel, authStrength: "basic" });
     [session] = await db.select().from(securitySessions).where(eq(securitySessions.id, sessionId)).limit(1);
   }
   if (!session || session.revokedAt) throw new Error("Esta sesión fue revocada; inicia una nueva sesión de seguridad");
-  await db.update(securitySessions).set({ label: context.deviceLabel, lastSeenAt: new Date() }).where(eq(securitySessions.id, session.id));
+  if (session.deviceId !== device.id) throw new Error("La sesión de seguridad no coincide con este dispositivo; inicia una nueva sesión");
+  await db.update(securitySessions).set({ label: context.deviceLabel, lastSeenAt: new Date(), updatedAt: new Date() }).where(eq(securitySessions.id, session.id));
   return { deviceId: device.id, sessionId: session.id };
 }
 
 export async function getSecurityOverview(userId: number, context: SecurityClientContext) {
   const db = requiredDb(await getDb());
   return db.transaction(async (tx) => {
-    const current = await ensureSecurityContext(tx, userId, context);
+    const current = await ensureSecurityContext(tx, userId, context, { allowRestricted: true });
     const periodStart = currentUtcDayStart();
     const [profile, devices, sessions, dailyControls, recentSecurityEvents] = await Promise.all([
       tx.select().from(userSecurityProfiles).where(eq(userSecurityProfiles.userId, userId)).limit(1),
