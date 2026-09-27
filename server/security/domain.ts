@@ -4,6 +4,7 @@ const SCRYPT_KEY_LENGTH = 64;
 
 /** Explicit sandbox guardrails; not a production risk policy or regulatory limit. */
 export const SANDBOX_SECURITY_POLICY = {
+  deviceTrustCoolingPeriodMs: 60 * 60 * 1000,
   maxPinAttempts: 5,
   pinLockDurationMs: 15 * 60 * 1000,
   maxOtpAttempts: 5,
@@ -67,5 +68,23 @@ export function assertSandboxTransferWithinSingleLimit(amountMinor: number) {
 export function assertSandboxDailyLimit(dailyOutgoingMinor: number, requestedAmountMinor: number) {
   if (dailyOutgoingMinor + requestedAmountMinor > SANDBOX_SECURITY_POLICY.maxDailyOutgoingMinor) {
     throw new Error("El monto supera el límite diario del sandbox");
+  }
+}
+
+export type DeviceTrustState = "new" | "pending" | "trusted" | "restricted" | "revoked";
+
+export function deviceTrustEligibleAt(requestedAt = new Date()) {
+  return new Date(requestedAt.getTime() + SANDBOX_SECURITY_POLICY.deviceTrustCoolingPeriodMs);
+}
+
+export function assertDeviceEligibleForTrust(eligibleAt: Date | null | undefined, now = new Date()) {
+  if (!eligibleAt || eligibleAt.getTime() > now.getTime()) {
+    throw new Error("El dispositivo aún está dentro del periodo de enfriamiento de seguridad");
+  }
+}
+
+export function assertTrustedDeviceState(status: DeviceTrustState) {
+  if (status !== "trusted") {
+    throw new Error("Este dispositivo aún no está marcado como confiable para operaciones financieras");
   }
 }

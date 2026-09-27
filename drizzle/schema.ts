@@ -52,7 +52,7 @@ export const dailyTransferControls = mysqlTable(
   ],
 );
 
-/** Trusted device metadata for the sandbox; use a platform credential in a real implementation. */
+/** Browser/device fingerprints are discovery signals, never automatic trust. */
 export const trustedDevices = mysqlTable(
   "trusted_devices",
   {
@@ -61,14 +61,20 @@ export const trustedDevices = mysqlTable(
     fingerprintHash: varchar("fingerprintHash", { length: 64 }).notNull(),
     label: varchar("label", { length: 100 }).notNull(),
     platform: varchar("platform", { length: 80 }).notNull(),
-    trustedAt: timestamp("trustedAt").defaultNow().notNull(),
+    status: mysqlEnum("device_trust_status", ["new", "pending", "trusted", "restricted", "revoked"]).default("new").notNull(),
+    enrollmentRequestedAt: timestamp("enrollmentRequestedAt").defaultNow().notNull(),
+    eligibleAt: timestamp("eligibleAt"),
+    trustedAt: timestamp("trustedAt"),
+    trustMethod: varchar("trustMethod", { length: 80 }),
     lastUsedAt: timestamp("lastUsedAt").defaultNow().notNull(),
     revokedAt: timestamp("revokedAt"),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
   },
   (table) => [
     uniqueIndex("trusted_device_user_fingerprint_unique").on(table.userId, table.fingerprintHash),
     index("trusted_device_user_idx").on(table.userId, table.lastUsedAt),
+    index("trusted_device_status_idx").on(table.userId, table.status),
   ],
 );
 
@@ -81,9 +87,11 @@ export const securitySessions = mysqlTable(
     deviceId: varchar("deviceId", { length: 36 }).notNull().references(() => trustedDevices.id),
     sessionFingerprintHash: varchar("sessionFingerprintHash", { length: 64 }).notNull(),
     label: varchar("label", { length: 100 }).notNull(),
+    authStrength: varchar("authStrength", { length: 32 }).default("basic").notNull(),
     lastSeenAt: timestamp("lastSeenAt").defaultNow().notNull(),
     revokedAt: timestamp("revokedAt"),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
   },
   (table) => [
     uniqueIndex("security_session_user_fingerprint_unique").on(table.userId, table.sessionFingerprintHash),
@@ -98,7 +106,7 @@ export const otpChallenges = mysqlTable(
     id: varchar("id", { length: 36 }).primaryKey(),
     userId: int("userId").notNull().references(() => users.id),
     sessionId: varchar("sessionId", { length: 36 }).notNull().references(() => securitySessions.id),
-    purpose: mysqlEnum("otp_purpose", ["transfer"]).notNull(),
+    purpose: mysqlEnum("otp_purpose", ["transfer", "device_enrollment"]).notNull(),
     codeHash: varchar("codeHash", { length: 255 }).notNull(),
     status: mysqlEnum("otp_challenge_status", ["issued", "verified", "consumed", "expired", "locked"]).default("issued").notNull(),
     attempts: int("attempts").default(0).notNull(),
@@ -138,10 +146,11 @@ export const financialAccounts = mysqlTable(
     id: varchar("id", { length: 64 }).primaryKey(),
     userId: int("userId").references(() => users.id),
     bankAccountId: varchar("bankAccountId", { length: 36 }).references(() => bankAccounts.id),
-    accountType: mysqlEnum("financial_account_type", ["user_wallet", "sandbox_clearing", "reserve"]).notNull(),
+    accountType: mysqlEnum("financial_account_type", ["user_wallet", "sandbox_clearing", "reserve", "provider_clearing", "fees"]).notNull(),
     currency: varchar("currency", { length: 3 }).default("HNL").notNull(),
     status: mysqlEnum("financial_account_status", ["active", "frozen", "closed"]).default("active").notNull(),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
   },
   (table) => [
     index("financial_account_user_idx").on(table.userId),
@@ -162,15 +171,22 @@ export const transfers = mysqlTable(
     destinationAccountId: varchar("destinationAccountId", { length: 64 }).notNull().references(() => financialAccounts.id),
     amountMinor: bigint("amountMinor", { mode: "number" }).notNull(),
     currency: varchar("currency", { length: 3 }).default("HNL").notNull(),
-    status: mysqlEnum("transfer_status", ["created", "authenticating", "risk_review", "authorized", "processing", "settled", "declined", "failed", "canceled", "reversed", "expired"]).notNull(),
+    status: mysqlEnum("transfer_status", ["created", "authenticating", "risk_review", "authorized", "processing", "unknown", "settled", "declined", "failed", "canceled", "reversed", "expired"]).notNull(),
     riskDecision: mysqlEnum("risk_decision", ["allow", "challenge", "review", "block"]).notNull(),
     idempotencyKey: varchar("idempotencyKey", { length: 128 }).notNull(),
     requestFingerprint: varchar("requestFingerprint", { length: 64 }).notNull(),
     providerReference: varchar("providerReference", { length: 96 }),
     failureCode: varchar("failureCode", { length: 80 }),
+    unknownReason: varchar("unknownReason", { length: 160 }),
+    settlementJournalId: varchar("settlementJournalId", { length: 36 }),
+    reversalJournalId: varchar("reversalJournalId", { length: 36 }),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
     authorizedAt: timestamp("authorizedAt"),
+    providerSubmittedAt: timestamp("providerSubmittedAt"),
+    providerAcceptedAt: timestamp("providerAcceptedAt"),
+    unknownAt: timestamp("unknownAt"),
     settledAt: timestamp("settledAt"),
+    reversedAt: timestamp("reversedAt"),
     updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
   },
   (table) => [
@@ -179,15 +195,60 @@ export const transfers = mysqlTable(
     index("transfer_sender_created_idx").on(table.senderUserId, table.createdAt),
     index("transfer_recipient_created_idx").on(table.recipientUserId, table.createdAt),
     index("transfer_status_idx").on(table.status),
+    index("transfer_provider_ref_idx").on(table.providerReference),
   ],
 );
 
-/** Immutable debit/credit records. A transfer is settled only after both entries are posted. */
+/** Reservations protect available funds before provider settlement. */
+export const fundReservations = mysqlTable(
+  "fund_reservations",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    transferId: varchar("transferId", { length: 36 }).notNull().references(() => transfers.id),
+    accountId: varchar("accountId", { length: 64 }).notNull().references(() => financialAccounts.id),
+    amountMinor: bigint("amountMinor", { mode: "number" }).notNull(),
+    currency: varchar("currency", { length: 3 }).default("HNL").notNull(),
+    status: mysqlEnum("hold_status", ["active", "captured", "released", "expired"]).default("active").notNull(),
+    expiresAt: timestamp("expiresAt"),
+    capturedAt: timestamp("capturedAt"),
+    releasedAt: timestamp("releasedAt"),
+    releaseReason: varchar("releaseReason", { length: 120 }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("fund_reservation_transfer_unique").on(table.transferId),
+    index("fund_reservation_account_status_idx").on(table.accountId, table.status),
+  ],
+);
+
+export const journalTransactions = mysqlTable(
+  "journal_transactions",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    reference: varchar("reference", { length: 64 }).notNull(),
+    transferId: varchar("transferId", { length: 36 }).references(() => transfers.id),
+    type: mysqlEnum("journal_type", ["sandbox_seed", "transfer_settlement", "reversal", "adjustment"]).notNull(),
+    status: mysqlEnum("journal_status", ["posted"]).default("posted").notNull(),
+    currency: varchar("currency", { length: 3 }).default("HNL").notNull(),
+    reversesJournalId: varchar("reversesJournalId", { length: 36 }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    postedAt: timestamp("postedAt").defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("journal_reference_unique").on(table.reference),
+    index("journal_transfer_idx").on(table.transferId),
+    index("journal_reversal_idx").on(table.reversesJournalId),
+  ],
+);
+
+/** Immutable debit/credit records. Corrections use compensating journals, never mutation. */
 export const ledgerEntries = mysqlTable(
   "ledger_entries",
   {
     id: varchar("id", { length: 36 }).primaryKey(),
-    transferId: varchar("transferId", { length: 36 }).notNull().references(() => transfers.id),
+    journalId: varchar("journalId", { length: 36 }).notNull().references(() => journalTransactions.id),
+    transferId: varchar("transferId", { length: 36 }).references(() => transfers.id),
     accountId: varchar("accountId", { length: 64 }).notNull().references(() => financialAccounts.id),
     direction: mysqlEnum("ledger_direction", ["debit", "credit"]).notNull(),
     amountMinor: bigint("amountMinor", { mode: "number" }).notNull(),
@@ -195,9 +256,10 @@ export const ledgerEntries = mysqlTable(
     createdAt: timestamp("createdAt").defaultNow().notNull(),
   },
   (table) => [
-    uniqueIndex("ledger_transfer_account_direction_unique").on(table.transferId, table.accountId, table.direction),
+    uniqueIndex("ledger_journal_account_direction_unique").on(table.journalId, table.accountId, table.direction),
     index("ledger_account_created_idx").on(table.accountId, table.createdAt),
     index("ledger_transfer_idx").on(table.transferId),
+    index("ledger_journal_idx").on(table.journalId),
   ],
 );
 
@@ -256,7 +318,7 @@ export const auditEvents = mysqlTable(
     action: varchar("action", { length: 120 }).notNull(),
     resource: varchar("resource", { length: 80 }).notNull(),
     resourceId: varchar("resourceId", { length: 80 }).notNull(),
-    requestId: varchar("requestId", { length: 64 }).notNull(),
+    requestId: varchar("requestId", { length: 128 }).notNull(),
     metadataHash: varchar("metadataHash", { length: 64 }).notNull(),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
   },
@@ -276,6 +338,7 @@ export const reconciliationItems = mysqlTable(
     status: mysqlEnum("reconciliation_status", ["match", "status_mismatch", "amount_mismatch", "missing_internal", "missing_external", "duplicate_external", "unknown"]).notNull(),
     investigatedAt: timestamp("investigatedAt"),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
   },
   (table) => [uniqueIndex("reconciliation_transfer_unique").on(table.transferId), index("reconciliation_status_idx").on(table.status)],
 );
@@ -312,9 +375,10 @@ export const outboxEvents = mysqlTable(
     aggregateId: varchar("aggregateId", { length: 64 }).notNull(),
     eventType: varchar("eventType", { length: 80 }).notNull(),
     payloadHash: varchar("payloadHash", { length: 64 }).notNull(),
-    status: mysqlEnum("outbox_status", ["pending", "dispatched", "failed"]).default("pending").notNull(),
+    status: mysqlEnum("outbox_status", ["pending", "dispatching", "dispatched", "unknown", "failed"]).default("pending").notNull(),
     attemptCount: int("attemptCount").default(0).notNull(),
     availableAt: timestamp("availableAt").defaultNow().notNull(),
+    claimedAt: timestamp("claimedAt"),
     dispatchedAt: timestamp("dispatchedAt"),
     failureCode: varchar("failureCode", { length: 80 }),
     createdAt: timestamp("createdAt").defaultNow().notNull(),

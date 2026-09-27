@@ -9,6 +9,7 @@ import {
   getFinancialDashboard,
   getSecurityOverview,
   listAdminOperations,
+  reconcilePendingSandboxTransfers,
   revokeOtherSecuritySessions,
   revokeSecuritySession,
   revokeTrustedDevice,
@@ -18,6 +19,13 @@ import {
   verifyTransferChallenge,
 } from "./db";
 import { FinancialInvariantError } from "./financial/domain";
+import {
+  getCurrentDeviceTrust,
+  requireTrustedSecurityContext,
+  requireTrustedTransferSession,
+  startDeviceEnrollment,
+  verifyDeviceEnrollment,
+} from "./security/deviceTrust";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
 import { adminProcedure, protectedProcedure, publicProcedure, router } from "./_core/trpc";
@@ -48,7 +56,7 @@ function financialError(error: unknown): never {
     if (error.message.includes("Insufficient")) throw new TRPCError({ code: "PRECONDITION_FAILED", message: error.message });
     if (error.message.includes("paused")) throw new TRPCError({ code: "PRECONDITION_FAILED", message: error.message });
     if (error.message.includes("valid recipient")) throw new TRPCError({ code: "BAD_REQUEST", message: error.message });
-    if (/(PIN|código|desafío|sesión|dispositivo|Configura|límite)/i.test(error.message)) throw new TRPCError({ code: "PRECONDITION_FAILED", message: error.message });
+    if (/(PIN|código|desafío|sesión|dispositivo|Configura|límite|confiable|enfriamiento)/i.test(error.message)) throw new TRPCError({ code: "PRECONDITION_FAILED", message: error.message });
   }
   throw error;
 }
@@ -73,6 +81,7 @@ export const appRouter = router({
     }),
     createTransfer: protectedProcedure.input(secureTransferInput).mutation(async ({ ctx, input }) => {
       try {
+        await requireTrustedTransferSession(ctx.user.id, input.sessionFingerprint);
         return await createSandboxTransfer(ctx.user.id, input);
       } catch (error) {
         return financialError(error);
@@ -80,7 +89,8 @@ export const appRouter = router({
     }),
     createPaymentRequest: protectedProcedure.input(transferInput.extend({ note: z.string().trim().max(140).optional() })).mutation(async ({ ctx, input }) => {
       try {
-        return await createPaymentRequest(ctx.user.id, input);
+        const result = await createPaymentRequest(ctx.user.id, input);
+        return { request: result.paymentRequest, replayed: result.replayed };
       } catch (error) {
         return financialError(error);
       }
@@ -96,7 +106,13 @@ export const appRouter = router({
   security: router({
     overview: protectedProcedure.input(securityContextInput).query(async ({ ctx, input }) => {
       try {
-        return await getSecurityOverview(ctx.user.id, input);
+        const current = await getCurrentDeviceTrust(ctx.user.id, input);
+        const overview = await getSecurityOverview(ctx.user.id, input);
+        return {
+          ...overview,
+          currentDeviceStatus: current.status,
+          currentDeviceEligibleAt: current.eligibleAt,
+        };
       } catch (error) {
         return financialError(error);
       }
@@ -108,8 +124,23 @@ export const appRouter = router({
         return financialError(error);
       }
     }),
+    startDeviceEnrollment: protectedProcedure.input(securityContextInput).mutation(async ({ ctx, input }) => {
+      try {
+        return await startDeviceEnrollment(ctx.user.id, input);
+      } catch (error) {
+        return financialError(error);
+      }
+    }),
+    verifyDeviceEnrollment: protectedProcedure.input(securityContextInput.extend({ challengeId: z.string().uuid(), pin: z.string().regex(/^\d{6}$/), code: z.string().regex(/^\d{6}$/) })).mutation(async ({ ctx, input }) => {
+      try {
+        return await verifyDeviceEnrollment(ctx.user.id, input, input.challengeId, input.pin, input.code);
+      } catch (error) {
+        return financialError(error);
+      }
+    }),
     startTransferVerification: protectedProcedure.input(securityContextInput).mutation(async ({ ctx, input }) => {
       try {
+        await requireTrustedSecurityContext(ctx.user.id, input);
         return await startTransferVerification(ctx.user.id, input);
       } catch (error) {
         return financialError(error);
@@ -117,6 +148,7 @@ export const appRouter = router({
     }),
     verifyTransfer: protectedProcedure.input(securityContextInput.extend({ challengeId: z.string().uuid(), pin: z.string().regex(/^\d{6}$/), code: z.string().regex(/^\d{6}$/) })).mutation(async ({ ctx, input }) => {
       try {
+        await requireTrustedSecurityContext(ctx.user.id, input);
         return await verifyTransferChallenge(ctx.user.id, input, input.challengeId, input.pin, input.code);
       } catch (error) {
         return financialError(error);
@@ -163,6 +195,13 @@ export const appRouter = router({
     dispatchSandboxOutbox: adminProcedure.input(z.object({ limit: z.number().int().min(1).max(50).default(20) })).mutation(async ({ ctx, input }) => {
       try {
         return await dispatchPendingSandboxOutbox(input.limit);
+      } catch (error) {
+        return financialError(error);
+      }
+    }),
+    reconcileSandboxTransfers: adminProcedure.input(z.object({ limit: z.number().int().min(1).max(100).default(50) })).mutation(async ({ input }) => {
+      try {
+        return await reconcilePendingSandboxTransfers(input.limit);
       } catch (error) {
         return financialError(error);
       }

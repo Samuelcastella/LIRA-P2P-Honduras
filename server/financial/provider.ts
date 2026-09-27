@@ -2,7 +2,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 
 export const SANDBOX_PROVIDER = "SandboxBankAdapter";
-export const PROVIDER_API_VERSION = "2026-09-sandbox";
+export const PROVIDER_API_VERSION = "2026-09-sandbox-v2";
 
 export const providerWebhookSchema = z.object({
   id: z.string().uuid(),
@@ -30,17 +30,31 @@ export type ProviderTransferResult = {
   acceptedAt: Date;
 };
 
+export type ProviderReconciliationCommand = {
+  providerReference?: string | null;
+  transferReference: string;
+  idempotencyKey: string;
+  amountMinor: number;
+  currency: "HNL";
+};
+
+export type ProviderReconciliationResult = {
+  providerReference?: string | null;
+  status: "unknown" | "processing" | "settled" | "failed" | "reversed";
+  amountMinor?: number;
+};
+
 export interface PaymentProvider {
   readonly name: string;
   readonly apiVersion: string;
   createTransfer(command: ProviderTransferCommand): Promise<ProviderTransferResult>;
   getTransfer(providerReference: string): Promise<{ providerReference: string; status: "processing" | "settled" | "failed" | "reversed" }>;
   cancelTransfer(providerReference: string): Promise<{ providerReference: string; status: "canceled" | "processing" }>;
-  reconcile(providerReference: string): Promise<{ providerReference: string; status: "unknown" | "processing" | "settled" | "failed" | "reversed" }>;
+  reconcile(command: ProviderReconciliationCommand): Promise<ProviderReconciliationResult>;
 }
 
 /**
- * Deterministic local adapter used only for product integration tests and the explicit sandbox.
+ * Deterministic local adapter used only for integration tests and the explicit sandbox.
  * It never sends a network request or moves money. Final settlement requires a verified webhook.
  */
 export class SandboxBankAdapter implements PaymentProvider {
@@ -63,8 +77,12 @@ export class SandboxBankAdapter implements PaymentProvider {
     return { providerReference, status: "processing" as const };
   }
 
-  async reconcile(providerReference: string) {
-    return { providerReference, status: "processing" as const };
+  async reconcile(command: ProviderReconciliationCommand): Promise<ProviderReconciliationResult> {
+    return {
+      providerReference: command.providerReference ?? `SBX-${command.transferReference}`,
+      status: "processing",
+      amountMinor: command.amountMinor,
+    };
   }
 }
 

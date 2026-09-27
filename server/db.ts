@@ -1,10 +1,12 @@
-import { and, desc, eq, lt, ne, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, lt, ne, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
 import {
   auditEvents,
   bankAccounts,
   dailyTransferControls,
   financialAccounts,
+  fundReservations,
+  journalTransactions,
   ledgerEntries,
   operationalControls,
   outboxEvents,
@@ -26,6 +28,8 @@ import {
   assertIdempotency,
   assertPositiveMinorAmount,
   createBalancedJournal,
+  createCompensatingJournal,
+  createJournalReference,
   createTransferReference,
   evaluateRisk,
   fingerprintIntent,
@@ -39,7 +43,9 @@ import {
   assertPin,
   assertSandboxDailyLimit,
   assertSandboxTransferWithinSingleLimit,
+  assertTrustedDeviceState,
   createOtpCode,
+  deviceTrustEligibleAt,
   hashSecret,
   isExpired,
   nextPinFailureState,
@@ -126,6 +132,230 @@ async function walletBalanceMinor(db: any, accountId: string) {
   return Number(rows[0]?.balance ?? 0);
 }
 
+async function activeReservedMinor(db: any, accountId: string) {
+  const rows = await db.select({
+    reserved: sql<number>`coalesce(sum(${fundReservations.amountMinor}), 0)`,
+  }).from(fundReservations).where(and(
+    eq(fundReservations.accountId, accountId),
+    eq(fundReservations.status, "active"),
+  ));
+  return Number(rows[0]?.reserved ?? 0);
+}
+
+async function availableBalanceMinor(db: any, accountId: string) {
+  return Math.max(0, (await walletBalanceMinor(db, accountId)) - (await activeReservedMinor(db, accountId)));
+}
+
+async function lockFinancialAccount(tx: any, accountId: string) {
+  await tx.execute(sql`select id from financial_accounts where id = ${accountId} for update`);
+  const [account] = await tx.select().from(financialAccounts).where(eq(financialAccounts.id, accountId)).limit(1);
+  if (!account) throw new Error("Financial account was not found");
+  return account;
+}
+
+async function lockTransfer(tx: any, transferId: string) {
+  await tx.execute(sql`select id from transfers where id = ${transferId} for update`);
+  const [transfer] = await tx.select().from(transfers).where(eq(transfers.id, transferId)).limit(1);
+  if (!transfer) throw new Error("Transfer was not found");
+  return transfer;
+}
+
+async function upsertReconciliation(tx: any, params: {
+  transferId: string;
+  providerReference: string;
+  expectedAmountMinor: number;
+  reportedAmountMinor?: number | null;
+  status: "match" | "status_mismatch" | "amount_mismatch" | "missing_internal" | "missing_external" | "duplicate_external" | "unknown";
+}) {
+  const now = new Date();
+  await tx.insert(reconciliationItems).values({
+    id: crypto.randomUUID(),
+    transferId: params.transferId,
+    provider: SANDBOX_PROVIDER,
+    providerReference: params.providerReference,
+    expectedAmountMinor: params.expectedAmountMinor,
+    reportedAmountMinor: params.reportedAmountMinor ?? null,
+    status: params.status,
+    updatedAt: now,
+  }).onDuplicateKeyUpdate({
+    set: {
+      provider: SANDBOX_PROVIDER,
+      providerReference: params.providerReference,
+      expectedAmountMinor: params.expectedAmountMinor,
+      reportedAmountMinor: params.reportedAmountMinor ?? null,
+      status: params.status,
+      updatedAt: now,
+    },
+  });
+}
+
+async function reserveFunds(tx: any, params: {
+  transferId: string;
+  accountId: string;
+  amountMinor: number;
+}) {
+  await lockFinancialAccount(tx, params.accountId);
+  const available = await availableBalanceMinor(tx, params.accountId);
+  if (available < params.amountMinor) throw new Error("Insufficient sandbox balance after active reservations");
+
+  await tx.insert(fundReservations).values({
+    id: crypto.randomUUID(),
+    transferId: params.transferId,
+    accountId: params.accountId,
+    amountMinor: params.amountMinor,
+    currency: "HNL",
+    status: "active",
+  });
+}
+
+async function releaseReservation(tx: any, transferId: string, reason: string) {
+  await tx.update(fundReservations).set({
+    status: "released",
+    releasedAt: new Date(),
+    releaseReason: reason.slice(0, 120),
+    updatedAt: new Date(),
+  }).where(and(eq(fundReservations.transferId, transferId), eq(fundReservations.status, "active")));
+}
+
+async function captureReservation(tx: any, transferId: string) {
+  await tx.update(fundReservations).set({
+    status: "captured",
+    capturedAt: new Date(),
+    updatedAt: new Date(),
+  }).where(and(eq(fundReservations.transferId, transferId), eq(fundReservations.status, "active")));
+}
+
+async function settleTransfer(tx: any, transferInput: any, providerReference: string, reportedAmountMinor: number) {
+  const transfer = await lockTransfer(tx, transferInput.id);
+  if (transfer.status === "settled" || transfer.status === "reversed") return transfer;
+  if (transfer.status !== "processing" && transfer.status !== "unknown") {
+    throw new Error(`Transfer state ${transfer.status} cannot settle`);
+  }
+  if (reportedAmountMinor !== transfer.amountMinor) {
+    await upsertReconciliation(tx, {
+      transferId: transfer.id,
+      providerReference,
+      expectedAmountMinor: transfer.amountMinor,
+      reportedAmountMinor,
+      status: "amount_mismatch",
+    });
+    throw new Error("Provider settlement amount does not match the transfer");
+  }
+
+  assertAllowedTransition(transfer.status, "settled");
+  const journalId = crypto.randomUUID();
+  const intent: TransferIntent = {
+    senderUserId: transfer.senderUserId,
+    recipientHandle: transfer.recipientHandle,
+    sourceAccountId: transfer.sourceAccountId,
+    destinationAccountId: transfer.destinationAccountId,
+    amountMinor: transfer.amountMinor,
+    currency: "HNL",
+    idempotencyKey: transfer.idempotencyKey,
+  };
+  const entries = createBalancedJournal(journalId, transfer.id, intent);
+  assertBalancedJournal(entries);
+
+  await tx.insert(journalTransactions).values({
+    id: journalId,
+    reference: createJournalReference("SET"),
+    transferId: transfer.id,
+    type: "transfer_settlement",
+    status: "posted",
+    currency: "HNL",
+  });
+  await tx.insert(ledgerEntries).values(entries);
+  await captureReservation(tx, transfer.id);
+  await tx.update(transfers).set({
+    status: "settled",
+    providerReference,
+    settlementJournalId: journalId,
+    settledAt: new Date(),
+    unknownAt: null,
+    unknownReason: null,
+    updatedAt: new Date(),
+  }).where(eq(transfers.id, transfer.id));
+  await upsertReconciliation(tx, {
+    transferId: transfer.id,
+    providerReference,
+    expectedAmountMinor: transfer.amountMinor,
+    reportedAmountMinor,
+    status: "match",
+  });
+
+  const [settled] = await tx.select().from(transfers).where(eq(transfers.id, transfer.id)).limit(1);
+  return settled ?? transfer;
+}
+
+async function failTransfer(tx: any, transferInput: any, providerReference: string, failureCode: string) {
+  const transfer = await lockTransfer(tx, transferInput.id);
+  if (transfer.status === "failed") return transfer;
+  if (transfer.status !== "processing" && transfer.status !== "unknown") {
+    throw new Error(`Transfer state ${transfer.status} cannot fail from provider outcome`);
+  }
+  assertAllowedTransition(transfer.status, "failed");
+  await releaseReservation(tx, transfer.id, failureCode);
+  await tx.update(transfers).set({
+    status: "failed",
+    providerReference,
+    failureCode: failureCode.slice(0, 80),
+    unknownAt: null,
+    unknownReason: null,
+    updatedAt: new Date(),
+  }).where(eq(transfers.id, transfer.id));
+  await upsertReconciliation(tx, {
+    transferId: transfer.id,
+    providerReference,
+    expectedAmountMinor: transfer.amountMinor,
+    reportedAmountMinor: null,
+    status: "match",
+  });
+  const [failed] = await tx.select().from(transfers).where(eq(transfers.id, transfer.id)).limit(1);
+  return failed ?? transfer;
+}
+
+async function reverseTransfer(tx: any, transferInput: any, providerReference: string) {
+  const transfer = await lockTransfer(tx, transferInput.id);
+  if (transfer.status === "reversed") return transfer;
+  if (transfer.status !== "settled" || !transfer.settlementJournalId) {
+    throw new Error("Only a settled transfer with a settlement journal can be reversed");
+  }
+
+  const originalEntries = await tx.select().from(ledgerEntries).where(eq(ledgerEntries.journalId, transfer.settlementJournalId));
+  if (originalEntries.length < 2) throw new Error("Settlement journal entries are missing for reversal");
+
+  assertAllowedTransition("settled", "reversed");
+  const reversalJournalId = crypto.randomUUID();
+  const entries = createCompensatingJournal(reversalJournalId, transfer.id, originalEntries);
+  await tx.insert(journalTransactions).values({
+    id: reversalJournalId,
+    reference: createJournalReference("REV"),
+    transferId: transfer.id,
+    type: "reversal",
+    status: "posted",
+    currency: "HNL",
+    reversesJournalId: transfer.settlementJournalId,
+  });
+  await tx.insert(ledgerEntries).values(entries);
+  await tx.update(transfers).set({
+    status: "reversed",
+    providerReference,
+    reversalJournalId,
+    reversedAt: new Date(),
+    updatedAt: new Date(),
+  }).where(eq(transfers.id, transfer.id));
+  await upsertReconciliation(tx, {
+    transferId: transfer.id,
+    providerReference,
+    expectedAmountMinor: transfer.amountMinor,
+    reportedAmountMinor: transfer.amountMinor,
+    status: "match",
+  });
+
+  const [reversed] = await tx.select().from(transfers).where(eq(transfers.id, transfer.id)).limit(1);
+  return reversed ?? transfer;
+}
+
 async function writeAudit(db: any, params: {
   actorUserId: number | null;
   actorType: "user" | "admin" | "system" | "provider";
@@ -162,33 +392,63 @@ function currentUtcDayStart(now = new Date()) {
   return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
 }
 
-async function ensureSecurityContext(db: any, userId: number, context: SecurityClientContext) {
+async function ensureSecurityContext(
+  db: any,
+  userId: number,
+  context: SecurityClientContext,
+  options: { allowRestricted?: boolean } = {},
+) {
   const deviceFingerprintHash = securityFingerprint(context.deviceFingerprint);
   const sessionFingerprintHash = securityFingerprint(context.sessionFingerprint);
   let [device] = await db.select().from(trustedDevices).where(and(eq(trustedDevices.userId, userId), eq(trustedDevices.fingerprintHash, deviceFingerprintHash))).limit(1);
   if (!device) {
+    const requestedAt = new Date();
     const deviceId = crypto.randomUUID();
-    await db.insert(trustedDevices).values({ id: deviceId, userId, fingerprintHash: deviceFingerprintHash, label: context.deviceLabel, platform: context.platform });
+    await db.insert(trustedDevices).values({
+      id: deviceId,
+      userId,
+      fingerprintHash: deviceFingerprintHash,
+      label: context.deviceLabel,
+      platform: context.platform,
+      status: "new",
+      enrollmentRequestedAt: requestedAt,
+      eligibleAt: deviceTrustEligibleAt(requestedAt),
+    });
     [device] = await db.select().from(trustedDevices).where(eq(trustedDevices.id, deviceId)).limit(1);
+    if (device) {
+      await writeAudit(db, {
+        actorUserId: userId,
+        actorType: "system",
+        action: "trusted_device_discovered",
+        resource: "trusted_device",
+        resourceId: device.id,
+        requestId: device.id,
+        metadata: { status: "new", sandbox: true },
+      });
+    }
   }
-  if (!device || device.revokedAt) throw new Error("Este dispositivo fue revocado; usa un dispositivo de confianza para continuar");
-  await db.update(trustedDevices).set({ label: context.deviceLabel, platform: context.platform, lastUsedAt: new Date() }).where(eq(trustedDevices.id, device.id));
+  if (!device || device.revokedAt || device.status === "revoked") throw new Error("Este dispositivo fue revocado; usa un dispositivo de confianza para continuar");
+  if (device.status === "restricted" && !options.allowRestricted) {
+    throw new Error("Este dispositivo está restringido y no puede realizar cambios de seguridad");
+  }
+  await db.update(trustedDevices).set({ label: context.deviceLabel, platform: context.platform, lastUsedAt: new Date(), updatedAt: new Date() }).where(eq(trustedDevices.id, device.id));
 
   let [session] = await db.select().from(securitySessions).where(and(eq(securitySessions.userId, userId), eq(securitySessions.sessionFingerprintHash, sessionFingerprintHash))).limit(1);
   if (!session) {
     const sessionId = crypto.randomUUID();
-    await db.insert(securitySessions).values({ id: sessionId, userId, deviceId: device.id, sessionFingerprintHash, label: context.deviceLabel });
+    await db.insert(securitySessions).values({ id: sessionId, userId, deviceId: device.id, sessionFingerprintHash, label: context.deviceLabel, authStrength: "basic" });
     [session] = await db.select().from(securitySessions).where(eq(securitySessions.id, sessionId)).limit(1);
   }
   if (!session || session.revokedAt) throw new Error("Esta sesión fue revocada; inicia una nueva sesión de seguridad");
-  await db.update(securitySessions).set({ label: context.deviceLabel, lastSeenAt: new Date() }).where(eq(securitySessions.id, session.id));
+  if (session.deviceId !== device.id) throw new Error("La sesión de seguridad no coincide con este dispositivo; inicia una nueva sesión");
+  await db.update(securitySessions).set({ label: context.deviceLabel, lastSeenAt: new Date(), updatedAt: new Date() }).where(eq(securitySessions.id, session.id));
   return { deviceId: device.id, sessionId: session.id };
 }
 
 export async function getSecurityOverview(userId: number, context: SecurityClientContext) {
   const db = requiredDb(await getDb());
   return db.transaction(async (tx) => {
-    const current = await ensureSecurityContext(tx, userId, context);
+    const current = await ensureSecurityContext(tx, userId, context, { allowRestricted: true });
     const periodStart = currentUtcDayStart();
     const [profile, devices, sessions, dailyControls, recentSecurityEvents] = await Promise.all([
       tx.select().from(userSecurityProfiles).where(eq(userSecurityProfiles.userId, userId)).limit(1),
@@ -223,7 +483,7 @@ export async function getSecurityOverview(userId: number, context: SecurityClien
 export async function setUserPin(userId: number, context: SecurityClientContext, pin: string, currentPin?: string) {
   assertPin(pin);
   const db = requiredDb(await getDb());
-  await db.transaction(async (tx) => {
+  const outcome = await db.transaction(async (tx) => {
     const current = await ensureSecurityContext(tx, userId, context);
     const [profile] = await tx.select().from(userSecurityProfiles).where(eq(userSecurityProfiles.userId, userId)).limit(1);
     if (profile?.lockedUntil && !isExpired(profile.lockedUntil)) throw new Error("El PIN está bloqueado temporalmente por intentos fallidos");
@@ -236,7 +496,7 @@ export async function setUserPin(userId: number, context: SecurityClientContext,
         const next = nextPinFailureState(profile?.failedPinAttempts ?? 0);
         await tx.update(userSecurityProfiles).set(next).where(eq(userSecurityProfiles.userId, userId));
         await writeAudit(tx, { actorUserId: userId, actorType: "user", action: "security_pin_rotation_rejected", resource: "security_profile", resourceId: String(userId), requestId: crypto.randomUUID(), metadata: { reason: "current_pin_invalid" } });
-        throw new Error(next.lockedUntil ? "PIN bloqueado durante 15 minutos por intentos fallidos" : "PIN actual incorrecto");
+        return { ok: false as const, message: next.lockedUntil ? "PIN bloqueado durante 15 minutos por intentos fallidos" : "PIN actual incorrecto" };
       }
     }
     const nextHash = hashSecret(pin);
@@ -249,7 +509,9 @@ export async function setUserPin(userId: number, context: SecurityClientContext,
       ? await tx.update(securitySessions).set({ revokedAt: new Date() }).where(and(eq(securitySessions.userId, userId), ne(securitySessions.id, current.sessionId), sql`${securitySessions.revokedAt} is null`))
       : null;
     await writeAudit(tx, { actorUserId: userId, actorType: "user", action: isRotation ? "security_pin_rotated" : "security_pin_set", resource: "security_profile", resourceId: String(userId), requestId: crypto.randomUUID(), metadata: { method: "scrypt", revokedOtherSessions: Number(revoked?.[0].affectedRows ?? 0), sandbox: true } });
+    return { ok: true as const };
   });
+  if (!outcome.ok) throw new Error(outcome.message);
   return { success: true } as const;
 }
 
@@ -257,6 +519,9 @@ export async function startTransferVerification(userId: number, context: Securit
   const db = requiredDb(await getDb());
   return db.transaction(async (tx) => {
     const current = await ensureSecurityContext(tx, userId, context);
+    const [device] = await tx.select().from(trustedDevices).where(eq(trustedDevices.id, current.deviceId)).limit(1);
+    if (!device || device.revokedAt) throw new Error("El dispositivo de esta sesión no está activo");
+    assertTrustedDeviceState(device.status);
     const [profile] = await tx.select().from(userSecurityProfiles).where(eq(userSecurityProfiles.userId, userId)).limit(1);
     if (!profile?.pinHash) throw new Error("Configura tu PIN de seguridad antes de validar una transferencia");
     if (profile.lockedUntil && !isExpired(profile.lockedUntil)) throw new Error("El PIN está bloqueado temporalmente por intentos fallidos");
@@ -274,43 +539,52 @@ export async function verifyTransferChallenge(userId: number, context: SecurityC
   assertPin(pin);
   assertOtp(code);
   const db = requiredDb(await getDb());
-  return db.transaction(async (tx) => {
+  const outcome = await db.transaction(async (tx) => {
     const current = await ensureSecurityContext(tx, userId, context);
+    const [device] = await tx.select().from(trustedDevices).where(eq(trustedDevices.id, current.deviceId)).limit(1);
+    if (!device || device.revokedAt) throw new Error("El dispositivo de esta sesión no está activo");
+    assertTrustedDeviceState(device.status);
     const [profile] = await tx.select().from(userSecurityProfiles).where(eq(userSecurityProfiles.userId, userId)).limit(1);
     if (!profile?.pinHash) throw new Error("Configura un PIN antes de validar transferencias");
     if (profile.lockedUntil && !isExpired(profile.lockedUntil)) throw new Error("El PIN está bloqueado temporalmente por intentos fallidos");
     if (!verifySecret(pin, profile.pinHash)) {
       const next = nextPinFailureState(profile.failedPinAttempts);
       await tx.update(userSecurityProfiles).set(next).where(eq(userSecurityProfiles.userId, userId));
-      throw new Error(next.lockedUntil ? "PIN bloqueado durante 15 minutos por intentos fallidos" : "PIN incorrecto");
+      return { ok: false as const, message: next.lockedUntil ? "PIN bloqueado durante 15 minutos por intentos fallidos" : "PIN incorrecto" };
     }
-    const [challenge] = await tx.select().from(otpChallenges).where(and(eq(otpChallenges.id, challengeId), eq(otpChallenges.userId, userId), eq(otpChallenges.sessionId, current.sessionId))).limit(1);
+    const [challenge] = await tx.select().from(otpChallenges).where(and(eq(otpChallenges.id, challengeId), eq(otpChallenges.userId, userId), eq(otpChallenges.sessionId, current.sessionId), eq(otpChallenges.purpose, "transfer"))).limit(1);
     if (!challenge) throw new Error("El desafío de seguridad no pertenece a esta sesión");
     if (challenge.status !== "issued" || isExpired(challenge.expiresAt)) {
       if (challenge.status === "issued") await tx.update(otpChallenges).set({ status: "expired" }).where(eq(otpChallenges.id, challenge.id));
-      throw new Error("El código expiró o ya fue usado; solicita uno nuevo");
+      return { ok: false as const, message: "El código expiró o ya fue usado; solicita uno nuevo" };
     }
     if (!verifySecret(code, challenge.codeHash)) {
       const attempts = challenge.attempts + 1;
       await tx.update(otpChallenges).set({ attempts, status: attempts >= SANDBOX_SECURITY_POLICY.maxOtpAttempts ? "locked" : "issued" }).where(eq(otpChallenges.id, challenge.id));
-      throw new Error(attempts >= SANDBOX_SECURITY_POLICY.maxOtpAttempts ? "Código bloqueado por demasiados intentos" : "Código de verificación incorrecto");
+      return { ok: false as const, message: attempts >= SANDBOX_SECURITY_POLICY.maxOtpAttempts ? "Código bloqueado por demasiados intentos" : "Código de verificación incorrecto" };
     }
     await tx.update(userSecurityProfiles).set({ failedPinAttempts: 0, lockedUntil: null }).where(eq(userSecurityProfiles.userId, userId));
     await tx.update(otpChallenges).set({ status: "verified", verifiedAt: new Date() }).where(eq(otpChallenges.id, challenge.id));
     await writeAudit(tx, { actorUserId: userId, actorType: "user", action: "transfer_otp_verified", resource: "otp_challenge", resourceId: challenge.id, requestId: challenge.id, metadata: { sessionId: current.sessionId } });
-    return { success: true } as const;
+    return { ok: true as const };
   });
+  if (!outcome.ok) throw new Error(outcome.message);
+  return { success: true } as const;
 }
 
 async function consumeVerifiedTransferChallenge(tx: any, userId: number, sessionFingerprint: string, challengeId: string) {
   const sessionFingerprintHash = securityFingerprint(sessionFingerprint);
   const [session] = await tx.select().from(securitySessions).where(and(eq(securitySessions.userId, userId), eq(securitySessions.sessionFingerprintHash, sessionFingerprintHash))).limit(1);
   if (!session || session.revokedAt) throw new Error("La sesión de seguridad no está activa");
+  const [device] = await tx.select().from(trustedDevices).where(eq(trustedDevices.id, session.deviceId)).limit(1);
+  if (!device || device.revokedAt) throw new Error("El dispositivo de la sesión no está activo");
+  assertTrustedDeviceState(device.status);
   const now = new Date();
   const result = await tx.update(otpChallenges).set({ status: "consumed", consumedAt: now }).where(and(
     eq(otpChallenges.id, challengeId),
     eq(otpChallenges.userId, userId),
     eq(otpChallenges.sessionId, session.id),
+    eq(otpChallenges.purpose, "transfer"),
     eq(otpChallenges.status, "verified"),
     sql`${otpChallenges.expiresAt} > ${now}`,
   ));
@@ -365,7 +639,7 @@ export async function revokeOtherSecuritySessions(userId: number, context: Secur
 export async function revokeTrustedDevice(userId: number, deviceId: string) {
   const db = requiredDb(await getDb());
   await db.transaction(async (tx) => {
-    const result = await tx.update(trustedDevices).set({ revokedAt: new Date() }).where(and(eq(trustedDevices.id, deviceId), eq(trustedDevices.userId, userId), sql`${trustedDevices.revokedAt} is null`));
+    const result = await tx.update(trustedDevices).set({ status: "revoked", revokedAt: new Date(), updatedAt: new Date() }).where(and(eq(trustedDevices.id, deviceId), eq(trustedDevices.userId, userId), sql`${trustedDevices.revokedAt} is null`));
     if (Number(result[0].affectedRows ?? 0) !== 1) throw new Error("El dispositivo no está activo o no pertenece al usuario");
     await tx.update(securitySessions).set({ revokedAt: new Date() }).where(and(eq(securitySessions.deviceId, deviceId), eq(securitySessions.userId, userId), sql`${securitySessions.revokedAt} is null`));
     await writeAudit(tx, { actorUserId: userId, actorType: "user", action: "trusted_device_revoked", resource: "trusted_device", resourceId: deviceId, requestId: deviceId, metadata: {} });
@@ -387,12 +661,12 @@ export async function ensureSandboxWorkspace(userId: number) {
       accountType: "sandbox_clearing",
       currency: "HNL",
       status: "active",
-    }).onDuplicateKeyUpdate({ set: { status: "active" } });
+    }).onDuplicateKeyUpdate({ set: { status: "active", updatedAt: new Date() } });
 
     await tx.insert(bankAccounts).values({
       id: bankAccountId,
       userId,
-      provider: "SandboxBankAdapter",
+      provider: SANDBOX_PROVIDER,
       externalAccountId: `SBX-${userId}`,
       displayName: "Banco Uno Sandbox",
       lastFour: "8421",
@@ -407,13 +681,17 @@ export async function ensureSandboxWorkspace(userId: number) {
       accountType: "user_wallet",
       currency: "HNL",
       status: "active",
-    }).onDuplicateKeyUpdate({ set: { status: "active", bankAccountId } });
+    }).onDuplicateKeyUpdate({ set: { status: "active", bankAccountId, updatedAt: new Date() } });
 
     const seedKey = `sandbox-seed-v1-${userId}`;
-    const existingSeed = await tx.select().from(transfers).where(and(eq(transfers.senderUserId, systemUser.id), eq(transfers.idempotencyKey, seedKey))).limit(1);
-    if (existingSeed[0]) return;
+    const [existingSeed] = await tx.select().from(transfers).where(and(
+      eq(transfers.senderUserId, systemUser.id),
+      eq(transfers.idempotencyKey, seedKey),
+    )).limit(1);
+    if (existingSeed) return;
 
     const seedTransferId = crypto.randomUUID();
+    const seedJournalId = crypto.randomUUID();
     const seedIntent: TransferIntent = {
       senderUserId: systemUser.id,
       recipientHandle: `@sandbox-user-${userId}`,
@@ -423,8 +701,9 @@ export async function ensureSandboxWorkspace(userId: number) {
       currency: "HNL",
       idempotencyKey: seedKey,
     };
-    const entries = createBalancedJournal(seedTransferId, seedIntent);
+    const entries = createBalancedJournal(seedJournalId, seedTransferId, seedIntent);
     assertBalancedJournal(entries);
+
     await tx.insert(transfers).values({
       id: seedTransferId,
       reference: createTransferReference(),
@@ -441,13 +720,22 @@ export async function ensureSandboxWorkspace(userId: number) {
       requestFingerprint: fingerprintIntent(seedIntent),
       providerReference: `SBX-FUND-${userId}`,
       authorizedAt: new Date(),
+      providerSubmittedAt: new Date(),
+      providerAcceptedAt: new Date(),
       settledAt: new Date(),
     });
-    await tx.insert(ledgerEntries).values(entries);
-    await tx.insert(reconciliationItems).values({
-      id: crypto.randomUUID(),
+    await tx.insert(journalTransactions).values({
+      id: seedJournalId,
+      reference: createJournalReference("SEED"),
       transferId: seedTransferId,
-      provider: "SandboxBankAdapter",
+      type: "sandbox_seed",
+      status: "posted",
+      currency: "HNL",
+    });
+    await tx.insert(ledgerEntries).values(entries);
+    await tx.update(transfers).set({ settlementJournalId: seedJournalId, updatedAt: new Date() }).where(eq(transfers.id, seedTransferId));
+    await upsertReconciliation(tx, {
+      transferId: seedTransferId,
       providerReference: `SBX-FUND-${userId}`,
       expectedAmountMinor: seedIntent.amountMinor,
       reportedAmountMinor: seedIntent.amountMinor,
@@ -460,7 +748,7 @@ export async function ensureSandboxWorkspace(userId: number) {
       resource: "transfer",
       resourceId: seedTransferId,
       requestId: seedKey,
-      metadata: { environment: "sandbox", amountMinor: seedIntent.amountMinor, currency: "HNL" },
+      metadata: { environment: "sandbox", amountMinor: seedIntent.amountMinor, currency: "HNL", journalId: seedJournalId },
     });
   });
 
@@ -470,7 +758,8 @@ export async function ensureSandboxWorkspace(userId: number) {
 export async function getFinancialDashboard(userId: number) {
   const db = requiredDb(await getDb());
   const { walletId } = await ensureSandboxWorkspace(userId);
-  const balanceMinor = await walletBalanceMinor(db, walletId);
+  const balanceMinor = await availableBalanceMinor(db, walletId);
+  const ledgerBalanceMinor = await walletBalanceMinor(db, walletId);
   const [accounts, recentTransfers, recentRisk, controls] = await Promise.all([
     db.select().from(bankAccounts).where(and(eq(bankAccounts.userId, userId), eq(bankAccounts.status, "linked"))),
     db.select().from(transfers).where(or(eq(transfers.senderUserId, userId), eq(transfers.recipientUserId, userId))).orderBy(desc(transfers.createdAt)).limit(20),
@@ -481,6 +770,7 @@ export async function getFinancialDashboard(userId: number) {
     environment: "sandbox" as const,
     currency: "HNL" as const,
     balanceMinor,
+    ledgerBalanceMinor,
     accounts,
     recentTransfers,
     recentRisk,
@@ -499,7 +789,7 @@ async function resolveCounterpartyAccount(db: ReturnType<typeof drizzle>, handle
     accountType: "user_wallet",
     currency: "HNL",
     status: "active",
-  }).onDuplicateKeyUpdate({ set: { status: "active" } });
+  }).onDuplicateKeyUpdate({ set: { status: "active", updatedAt: new Date() } });
   return id;
 }
 
@@ -517,18 +807,19 @@ export async function createSandboxTransfer(userId: number, input: Omit<Transfer
   const fingerprint = fingerprintIntent(intent);
 
   return db.transaction(async (tx) => {
-    const control = await tx.select().from(operationalControls).where(eq(operationalControls.control, "transfers_enabled")).limit(1);
-    if (control[0]?.enabled === 0) throw new Error("Transfers are temporarily paused by an operational control");
+    const [control] = await tx.select().from(operationalControls).where(eq(operationalControls.control, "transfers_enabled")).limit(1);
+    if (control?.enabled === 0) throw new Error("Transfers are temporarily paused by an operational control");
 
-    const prior = await tx.select().from(transfers).where(and(eq(transfers.senderUserId, userId), eq(transfers.idempotencyKey, intent.idempotencyKey))).limit(1);
-    if (prior[0]) {
-      assertIdempotency(prior[0].requestFingerprint, fingerprint);
-      return { transfer: prior[0], replayed: true };
+    const [prior] = await tx.select().from(transfers).where(and(
+      eq(transfers.senderUserId, userId),
+      eq(transfers.idempotencyKey, intent.idempotencyKey),
+    )).limit(1);
+    if (prior) {
+      assertIdempotency(prior.requestFingerprint, fingerprint);
+      return { transfer: prior, replayed: true };
     }
 
     assertSandboxTransferWithinSingleLimit(intent.amountMinor);
-    const balanceMinor = await walletBalanceMinor(tx, walletId);
-    if (balanceMinor < intent.amountMinor) throw new Error("Insufficient sandbox balance");
     await reserveSandboxDailyTransferLimit(tx, userId, intent.amountMinor, intent.idempotencyKey);
     await consumeVerifiedTransferChallenge(tx, userId, sessionFingerprint, verificationChallengeId);
 
@@ -553,29 +844,72 @@ export async function createSandboxTransfer(userId: number, input: Omit<Transfer
       idempotencyKey: intent.idempotencyKey,
       requestFingerprint: fingerprint,
     });
-    await writeAudit(tx, { actorUserId: userId, actorType: "user", action: "transfer_created", resource: "transfer", resourceId: transferId, requestId: intent.idempotencyKey, metadata: { amountMinor: intent.amountMinor, currency: intent.currency } });
+    await writeAudit(tx, {
+      actorUserId: userId,
+      actorType: "user",
+      action: "transfer_created",
+      resource: "transfer",
+      resourceId: transferId,
+      requestId: intent.idempotencyKey,
+      metadata: { amountMinor: intent.amountMinor, currency: intent.currency },
+    });
 
     assertAllowedTransition("created", "authenticating");
-    await tx.update(transfers).set({ status: "authenticating" }).where(eq(transfers.id, transferId));
+    await tx.update(transfers).set({ status: "authenticating", updatedAt: new Date() }).where(eq(transfers.id, transferId));
     assertAllowedTransition("authenticating", "risk_review");
-    await tx.update(transfers).set({ status: "risk_review" }).where(eq(transfers.id, transferId));
-    await tx.insert(riskEvents).values({ id: crypto.randomUUID(), userId, transferId, rule: risk.rule, score: risk.score, severity: risk.severity, decision: risk.decision, policyVersion: risk.policyVersion });
-    await writeAudit(tx, { actorUserId: userId, actorType: "system", action: "risk_decision_recorded", resource: "transfer", resourceId: transferId, requestId: intent.idempotencyKey, metadata: { decision: risk.decision, rule: risk.rule, policyVersion: risk.policyVersion } });
+    await tx.update(transfers).set({ status: "risk_review", updatedAt: new Date() }).where(eq(transfers.id, transferId));
+    await tx.insert(riskEvents).values({
+      id: crypto.randomUUID(),
+      userId,
+      transferId,
+      rule: risk.rule,
+      score: risk.score,
+      severity: risk.severity,
+      decision: risk.decision,
+      policyVersion: risk.policyVersion,
+    });
+    await writeAudit(tx, {
+      actorUserId: userId,
+      actorType: "system",
+      action: "risk_decision_recorded",
+      resource: "transfer",
+      resourceId: transferId,
+      requestId: intent.idempotencyKey,
+      metadata: { decision: risk.decision, rule: risk.rule, policyVersion: risk.policyVersion },
+    });
 
     if (risk.decision === "block" || risk.decision === "review") {
       assertAllowedTransition("risk_review", "declined");
-      await tx.update(transfers).set({ status: "declined", failureCode: `risk_${risk.decision}` }).where(eq(transfers.id, transferId));
-      await writeAudit(tx, { actorUserId: userId, actorType: "system", action: "transfer_declined", resource: "transfer", resourceId: transferId, requestId: intent.idempotencyKey, metadata: { reason: `risk_${risk.decision}` } });
+      await tx.update(transfers).set({ status: "declined", failureCode: `risk_${risk.decision}`, updatedAt: new Date() }).where(eq(transfers.id, transferId));
+      await writeAudit(tx, {
+        actorUserId: userId,
+        actorType: "system",
+        action: "transfer_declined",
+        resource: "transfer",
+        resourceId: transferId,
+        requestId: intent.idempotencyKey,
+        metadata: { reason: `risk_${risk.decision}` },
+      });
       const [declined] = await tx.select().from(transfers).where(eq(transfers.id, transferId)).limit(1);
       if (!declined) throw new Error("Transfer was not persisted");
       return { transfer: declined, replayed: false };
     }
 
     assertAllowedTransition("risk_review", "authorized");
-    await tx.update(transfers).set({ status: "authorized", authorizedAt: new Date() }).where(eq(transfers.id, transferId));
-    assertAllowedTransition("authorized", "processing");
-    await tx.update(transfers).set({ status: "processing" }).where(eq(transfers.id, transferId));
+    await tx.update(transfers).set({ status: "authorized", authorizedAt: new Date(), updatedAt: new Date() }).where(eq(transfers.id, transferId));
+    await reserveFunds(tx, { transferId, accountId: walletId, amountMinor: intent.amountMinor });
+    await writeAudit(tx, {
+      actorUserId: userId,
+      actorType: "system",
+      action: "funds_reserved",
+      resource: "transfer",
+      resourceId: transferId,
+      requestId: intent.idempotencyKey,
+      metadata: { amountMinor: intent.amountMinor, accountId: walletId },
+    });
 
+    assertAllowedTransition("authorized", "processing");
+    await tx.update(transfers).set({ status: "processing", updatedAt: new Date() }).where(eq(transfers.id, transferId));
     await tx.insert(outboxEvents).values({
       id: crypto.randomUUID(),
       aggregateType: "transfer",
@@ -585,7 +919,15 @@ export async function createSandboxTransfer(userId: number, input: Omit<Transfer
       status: "pending",
       attemptCount: 0,
     });
-    await writeAudit(tx, { actorUserId: userId, actorType: "system", action: "provider_dispatch_queued", resource: "transfer", resourceId: transferId, requestId: intent.idempotencyKey, metadata: { provider: SANDBOX_PROVIDER, outbox: "pending" } });
+    await writeAudit(tx, {
+      actorUserId: userId,
+      actorType: "system",
+      action: "provider_dispatch_queued",
+      resource: "transfer",
+      resourceId: transferId,
+      requestId: intent.idempotencyKey,
+      metadata: { provider: SANDBOX_PROVIDER, outbox: "pending" },
+    });
 
     const [processing] = await tx.select().from(transfers).where(eq(transfers.id, transferId)).limit(1);
     if (!processing) throw new Error("Transfer was not persisted");
@@ -598,77 +940,363 @@ export async function dispatchPendingSandboxOutbox(limit = 20) {
   const adapter = new SandboxBankAdapter();
   const pending = await db.select().from(outboxEvents)
     .where(and(eq(outboxEvents.status, "pending"), eq(outboxEvents.eventType, "provider.transfer.requested")))
-    .orderBy(outboxEvents.createdAt).limit(limit);
+    .orderBy(outboxEvents.createdAt)
+    .limit(limit);
 
   let dispatched = 0;
+  let unknown = 0;
+
   for (const event of pending) {
-    await db.transaction(async (tx) => {
-      const [transfer] = await tx.select().from(transfers).where(eq(transfers.id, event.aggregateId)).limit(1);
-      if (!transfer || transfer.status !== "processing") {
-        await tx.update(outboxEvents).set({ status: "failed", failureCode: "transfer_not_dispatchable", attemptCount: event.attemptCount + 1 }).where(eq(outboxEvents.id, event.id));
-        return;
+    const claimed = await db.transaction(async (tx) => {
+      const claim = await tx.update(outboxEvents).set({
+        status: "dispatching",
+        claimedAt: new Date(),
+        attemptCount: sql`${outboxEvents.attemptCount} + 1`,
+        failureCode: null,
+        updatedAt: new Date(),
+      }).where(and(eq(outboxEvents.id, event.id), eq(outboxEvents.status, "pending")));
+      if (Number(claim[0].affectedRows ?? 0) !== 1) return null;
+
+      const [candidate] = await tx.select().from(transfers).where(eq(transfers.id, event.aggregateId)).limit(1);
+      if (!candidate || candidate.status !== "processing") {
+        await tx.update(outboxEvents).set({
+          status: "failed",
+          failureCode: "transfer_not_dispatchable",
+          updatedAt: new Date(),
+        }).where(eq(outboxEvents.id, event.id));
+        return null;
       }
-      const providerResult = await adapter.createTransfer({ transferReference: transfer.reference, amountMinor: transfer.amountMinor, currency: "HNL", idempotencyKey: transfer.idempotencyKey });
-      await tx.update(transfers).set({ providerReference: providerResult.providerReference }).where(eq(transfers.id, transfer.id));
-      await tx.update(outboxEvents).set({ status: "dispatched", dispatchedAt: new Date(), attemptCount: event.attemptCount + 1 }).where(eq(outboxEvents.id, event.id));
-      await writeAudit(tx, { actorUserId: null, actorType: "system", action: "provider_dispatch_completed", resource: "transfer", resourceId: transfer.id, requestId: event.id, metadata: { provider: adapter.name, providerReference: providerResult.providerReference } });
-      dispatched += 1;
+      const transfer = await lockTransfer(tx, candidate.id);
+      await tx.update(transfers).set({ providerSubmittedAt: new Date(), updatedAt: new Date() }).where(eq(transfers.id, transfer.id));
+      return transfer;
     });
+    if (!claimed) continue;
+
+    try {
+      const providerResult = await adapter.createTransfer({
+        transferReference: claimed.reference,
+        amountMinor: claimed.amountMinor,
+        currency: "HNL",
+        idempotencyKey: claimed.idempotencyKey,
+      });
+
+      await db.transaction(async (tx) => {
+        const current = await lockTransfer(tx, claimed.id);
+        if (current.status !== "processing" && current.status !== "unknown") {
+          await tx.update(outboxEvents).set({
+            status: "failed",
+            failureCode: "transfer_not_dispatchable_after_provider_call",
+            updatedAt: new Date(),
+          }).where(eq(outboxEvents.id, event.id));
+          return;
+        }
+        if (current.status === "unknown") {
+          assertAllowedTransition("unknown", "processing");
+        }
+        await tx.update(transfers).set({
+          status: "processing",
+          providerReference: providerResult.providerReference,
+          providerAcceptedAt: providerResult.acceptedAt,
+          unknownAt: null,
+          unknownReason: null,
+          updatedAt: new Date(),
+        }).where(eq(transfers.id, current.id));
+        await tx.update(outboxEvents).set({
+          status: "dispatched",
+          dispatchedAt: new Date(),
+          failureCode: null,
+          updatedAt: new Date(),
+        }).where(eq(outboxEvents.id, event.id));
+        await writeAudit(tx, {
+          actorUserId: null,
+          actorType: "system",
+          action: "provider_dispatch_completed",
+          resource: "transfer",
+          resourceId: current.id,
+          requestId: event.id,
+          metadata: { provider: adapter.name, providerReference: providerResult.providerReference },
+        });
+      });
+      dispatched += 1;
+    } catch (error) {
+      await db.transaction(async (tx) => {
+        const current = await lockTransfer(tx, claimed.id);
+        if (current.status === "processing") {
+          assertAllowedTransition("processing", "unknown");
+          await tx.update(transfers).set({
+            status: "unknown",
+            unknownAt: new Date(),
+            unknownReason: "provider_submission_outcome_unknown",
+            updatedAt: new Date(),
+          }).where(eq(transfers.id, current.id));
+        }
+        await tx.update(outboxEvents).set({
+          status: "unknown",
+          failureCode: "provider_submission_outcome_unknown",
+          updatedAt: new Date(),
+        }).where(eq(outboxEvents.id, event.id));
+        await upsertReconciliation(tx, {
+          transferId: current.id,
+          providerReference: current.providerReference ?? `UNRESOLVED-${current.reference}`,
+          expectedAmountMinor: current.amountMinor,
+          reportedAmountMinor: null,
+          status: "unknown",
+        });
+        await writeAudit(tx, {
+          actorUserId: null,
+          actorType: "system",
+          action: "provider_dispatch_unknown",
+          resource: "transfer",
+          resourceId: current.id,
+          requestId: event.id,
+          metadata: { provider: adapter.name, errorClass: error instanceof Error ? error.name : "unknown" },
+        });
+      });
+      unknown += 1;
+    }
   }
-  return { dispatched };
+
+  return { dispatched, unknown };
 }
 
 export async function processVerifiedProviderWebhook(webhook: ProviderWebhook, payloadHash: string) {
   const db = requiredDb(await getDb());
   return db.transaction(async (tx) => {
-    const [prior] = await tx.select().from(providerWebhookEvents)
-      .where(and(eq(providerWebhookEvents.provider, SANDBOX_PROVIDER), eq(providerWebhookEvents.providerEventId, webhook.id))).limit(1);
+    const [prior] = await tx.select().from(providerWebhookEvents).where(and(
+      eq(providerWebhookEvents.provider, SANDBOX_PROVIDER),
+      eq(providerWebhookEvents.providerEventId, webhook.id),
+    )).limit(1);
     if (prior) return { accepted: false, duplicate: true, reason: "duplicate_event" as const };
 
-    const [transfer] = await tx.select().from(transfers).where(eq(transfers.reference, webhook.transferReference)).limit(1);
-    if (!transfer || transfer.providerReference !== webhook.providerReference) {
-      await tx.insert(providerWebhookEvents).values({ id: crypto.randomUUID(), provider: SANDBOX_PROVIDER, providerEventId: webhook.id, eventType: webhook.type, transferReference: webhook.transferReference, providerReference: webhook.providerReference, sequence: webhook.sequence, occurredAt: new Date(webhook.occurredAt), payloadHash, status: "rejected", reason: "unknown_or_mismatched_transfer" });
-      return { accepted: false, duplicate: false, reason: "unknown_or_mismatched_transfer" as const };
+    const [candidate] = await tx.select().from(transfers).where(eq(transfers.reference, webhook.transferReference)).limit(1);
+    if (!candidate) {
+      await tx.insert(providerWebhookEvents).values({
+        id: crypto.randomUUID(),
+        provider: SANDBOX_PROVIDER,
+        providerEventId: webhook.id,
+        eventType: webhook.type,
+        transferReference: webhook.transferReference,
+        providerReference: webhook.providerReference,
+        sequence: webhook.sequence,
+        occurredAt: new Date(webhook.occurredAt),
+        payloadHash,
+        status: "rejected",
+        reason: "unknown_transfer",
+      });
+      return { accepted: false, duplicate: false, reason: "unknown_transfer" as const };
     }
 
-    const newerEvent = await tx.select().from(providerWebhookEvents)
-      .where(and(eq(providerWebhookEvents.provider, SANDBOX_PROVIDER), eq(providerWebhookEvents.transferReference, webhook.transferReference), sql`${providerWebhookEvents.sequence} >= ${webhook.sequence}`)).limit(1);
-    if (newerEvent[0]) {
-      await tx.insert(providerWebhookEvents).values({ id: crypto.randomUUID(), provider: SANDBOX_PROVIDER, providerEventId: webhook.id, eventType: webhook.type, transferReference: webhook.transferReference, providerReference: webhook.providerReference, sequence: webhook.sequence, occurredAt: new Date(webhook.occurredAt), payloadHash, status: "ignored", reason: "out_of_order_event" });
+    let transfer = await lockTransfer(tx, candidate.id);
+    if (transfer.providerReference && transfer.providerReference !== webhook.providerReference) {
+      await tx.insert(providerWebhookEvents).values({
+        id: crypto.randomUUID(),
+        provider: SANDBOX_PROVIDER,
+        providerEventId: webhook.id,
+        eventType: webhook.type,
+        transferReference: webhook.transferReference,
+        providerReference: webhook.providerReference,
+        sequence: webhook.sequence,
+        occurredAt: new Date(webhook.occurredAt),
+        payloadHash,
+        status: "rejected",
+        reason: "provider_reference_mismatch",
+      });
+      return { accepted: false, duplicate: false, reason: "provider_reference_mismatch" as const };
+    }
+
+    if (!transfer.providerReference) {
+      await tx.update(transfers).set({
+        providerReference: webhook.providerReference,
+        providerAcceptedAt: new Date(webhook.occurredAt),
+        updatedAt: new Date(),
+      }).where(eq(transfers.id, transfer.id));
+      transfer = { ...transfer, providerReference: webhook.providerReference };
+    }
+
+    const [newerEvent] = await tx.select().from(providerWebhookEvents).where(and(
+      eq(providerWebhookEvents.provider, SANDBOX_PROVIDER),
+      eq(providerWebhookEvents.transferReference, webhook.transferReference),
+      sql`${providerWebhookEvents.sequence} >= ${webhook.sequence}`,
+    )).limit(1);
+    if (newerEvent) {
+      await tx.insert(providerWebhookEvents).values({
+        id: crypto.randomUUID(),
+        provider: SANDBOX_PROVIDER,
+        providerEventId: webhook.id,
+        eventType: webhook.type,
+        transferReference: webhook.transferReference,
+        providerReference: webhook.providerReference,
+        sequence: webhook.sequence,
+        occurredAt: new Date(webhook.occurredAt),
+        payloadHash,
+        status: "ignored",
+        reason: "out_of_order_event",
+      });
       return { accepted: false, duplicate: false, reason: "out_of_order_event" as const };
     }
 
-    if (webhook.type === "transfer.settled" && transfer.status === "processing" && webhook.amountMinor !== transfer.amountMinor) {
-      await tx.insert(reconciliationItems).values({ id: crypto.randomUUID(), transferId: transfer.id, provider: SANDBOX_PROVIDER, providerReference: webhook.providerReference, expectedAmountMinor: transfer.amountMinor, reportedAmountMinor: webhook.amountMinor, status: "amount_mismatch" });
-      await tx.insert(providerWebhookEvents).values({ id: crypto.randomUUID(), provider: SANDBOX_PROVIDER, providerEventId: webhook.id, eventType: webhook.type, transferReference: webhook.transferReference, providerReference: webhook.providerReference, sequence: webhook.sequence, occurredAt: new Date(webhook.occurredAt), payloadHash, status: "rejected", reason: "amount_mismatch" });
-      await writeAudit(tx, { actorUserId: null, actorType: "provider", action: "provider_settlement_rejected", resource: "transfer", resourceId: transfer.id, requestId: webhook.id, metadata: { expectedAmountMinor: transfer.amountMinor, reportedAmountMinor: webhook.amountMinor } });
-      return { accepted: false, duplicate: false, reason: "amount_mismatch" as const };
+    try {
+      if (webhook.type === "transfer.settled") {
+        await settleTransfer(tx, transfer, webhook.providerReference, webhook.amountMinor);
+        await tx.insert(providerWebhookEvents).values({
+          id: crypto.randomUUID(), provider: SANDBOX_PROVIDER, providerEventId: webhook.id, eventType: webhook.type,
+          transferReference: webhook.transferReference, providerReference: webhook.providerReference, sequence: webhook.sequence,
+          occurredAt: new Date(webhook.occurredAt), payloadHash, status: "accepted",
+        });
+        await writeAudit(tx, {
+          actorUserId: null, actorType: "provider", action: "provider_settlement_accepted", resource: "transfer",
+          resourceId: transfer.id, requestId: webhook.id, metadata: { provider: SANDBOX_PROVIDER, amountMinor: webhook.amountMinor, sequence: webhook.sequence },
+        });
+        return { accepted: true, duplicate: false, reason: "settled" as const };
+      }
+
+      if (webhook.type === "transfer.failed") {
+        await failTransfer(tx, transfer, webhook.providerReference, "provider_failed");
+        await tx.insert(providerWebhookEvents).values({
+          id: crypto.randomUUID(), provider: SANDBOX_PROVIDER, providerEventId: webhook.id, eventType: webhook.type,
+          transferReference: webhook.transferReference, providerReference: webhook.providerReference, sequence: webhook.sequence,
+          occurredAt: new Date(webhook.occurredAt), payloadHash, status: "accepted",
+        });
+        await writeAudit(tx, {
+          actorUserId: null, actorType: "provider", action: "provider_failure_accepted", resource: "transfer",
+          resourceId: transfer.id, requestId: webhook.id, metadata: { provider: SANDBOX_PROVIDER, sequence: webhook.sequence },
+        });
+        return { accepted: true, duplicate: false, reason: "failed" as const };
+      }
+
+      if (webhook.type === "transfer.reversed") {
+        await reverseTransfer(tx, transfer, webhook.providerReference);
+        await tx.insert(providerWebhookEvents).values({
+          id: crypto.randomUUID(), provider: SANDBOX_PROVIDER, providerEventId: webhook.id, eventType: webhook.type,
+          transferReference: webhook.transferReference, providerReference: webhook.providerReference, sequence: webhook.sequence,
+          occurredAt: new Date(webhook.occurredAt), payloadHash, status: "accepted",
+        });
+        await writeAudit(tx, {
+          actorUserId: null, actorType: "provider", action: "provider_reversal_accepted", resource: "transfer",
+          resourceId: transfer.id, requestId: webhook.id, metadata: { provider: SANDBOX_PROVIDER, sequence: webhook.sequence },
+        });
+        return { accepted: true, duplicate: false, reason: "reversed" as const };
+      }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "provider_event_rejected";
+      await tx.insert(providerWebhookEvents).values({
+        id: crypto.randomUUID(), provider: SANDBOX_PROVIDER, providerEventId: webhook.id, eventType: webhook.type,
+        transferReference: webhook.transferReference, providerReference: webhook.providerReference, sequence: webhook.sequence,
+        occurredAt: new Date(webhook.occurredAt), payloadHash, status: "rejected", reason: reason.slice(0, 160),
+      });
+      await writeAudit(tx, {
+        actorUserId: null, actorType: "provider", action: "provider_event_rejected", resource: "transfer",
+        resourceId: transfer.id, requestId: webhook.id, metadata: { reason: reason.slice(0, 120) },
+      });
+      return { accepted: false, duplicate: false, reason: "provider_event_rejected" as const };
     }
 
-    if (webhook.type === "transfer.settled" && transfer.status === "processing") {
-      const intent: TransferIntent = { senderUserId: transfer.senderUserId, recipientHandle: transfer.recipientHandle, sourceAccountId: transfer.sourceAccountId, destinationAccountId: transfer.destinationAccountId, amountMinor: transfer.amountMinor, currency: "HNL", idempotencyKey: transfer.idempotencyKey };
-      const entries = createBalancedJournal(transfer.id, intent);
-      assertBalancedJournal(entries);
-      assertAllowedTransition("processing", "settled");
-      await tx.insert(ledgerEntries).values(entries);
-      await tx.update(transfers).set({ status: "settled", settledAt: new Date() }).where(eq(transfers.id, transfer.id));
-      await tx.insert(reconciliationItems).values({ id: crypto.randomUUID(), transferId: transfer.id, provider: SANDBOX_PROVIDER, providerReference: webhook.providerReference, expectedAmountMinor: transfer.amountMinor, reportedAmountMinor: webhook.amountMinor, status: "match" });
-      await tx.insert(providerWebhookEvents).values({ id: crypto.randomUUID(), provider: SANDBOX_PROVIDER, providerEventId: webhook.id, eventType: webhook.type, transferReference: webhook.transferReference, providerReference: webhook.providerReference, sequence: webhook.sequence, occurredAt: new Date(webhook.occurredAt), payloadHash, status: "accepted" });
-      await writeAudit(tx, { actorUserId: null, actorType: "provider", action: "provider_settlement_accepted", resource: "transfer", resourceId: transfer.id, requestId: webhook.id, metadata: { provider: SANDBOX_PROVIDER, amountMinor: webhook.amountMinor, sequence: webhook.sequence } });
-      return { accepted: true, duplicate: false, reason: "settled" as const };
-    }
-
-    if (webhook.type === "transfer.failed" && transfer.status === "processing") {
-      assertAllowedTransition("processing", "failed");
-      await tx.update(transfers).set({ status: "failed", failureCode: "provider_failed" }).where(eq(transfers.id, transfer.id));
-      await tx.insert(providerWebhookEvents).values({ id: crypto.randomUUID(), provider: SANDBOX_PROVIDER, providerEventId: webhook.id, eventType: webhook.type, transferReference: webhook.transferReference, providerReference: webhook.providerReference, sequence: webhook.sequence, occurredAt: new Date(webhook.occurredAt), payloadHash, status: "accepted" });
-      await writeAudit(tx, { actorUserId: null, actorType: "provider", action: "provider_failure_accepted", resource: "transfer", resourceId: transfer.id, requestId: webhook.id, metadata: { provider: SANDBOX_PROVIDER, sequence: webhook.sequence } });
-      return { accepted: true, duplicate: false, reason: "failed" as const };
-    }
-
-    await tx.insert(providerWebhookEvents).values({ id: crypto.randomUUID(), provider: SANDBOX_PROVIDER, providerEventId: webhook.id, eventType: webhook.type, transferReference: webhook.transferReference, providerReference: webhook.providerReference, sequence: webhook.sequence, occurredAt: new Date(webhook.occurredAt), payloadHash, status: "ignored", reason: `state_${transfer.status}_does_not_accept_${webhook.type}`.slice(0, 160) });
-    return { accepted: false, duplicate: false, reason: "invalid_state_transition" as const };
+    return { accepted: false, duplicate: false, reason: "unsupported_event" as const };
   });
+}
+
+export async function reconcilePendingSandboxTransfers(limit = 50) {
+  const db = requiredDb(await getDb());
+  const adapter = new SandboxBankAdapter();
+  const candidates = await db.select().from(transfers)
+    .where(inArray(transfers.status, ["processing", "unknown"]))
+    .orderBy(transfers.updatedAt)
+    .limit(limit);
+
+  let checked = 0;
+  let resolved = 0;
+
+  for (const candidate of candidates) {
+    let provider;
+    try {
+      provider = await adapter.reconcile({
+        providerReference: candidate.providerReference,
+        transferReference: candidate.reference,
+        idempotencyKey: candidate.idempotencyKey,
+        amountMinor: candidate.amountMinor,
+        currency: "HNL",
+      });
+    } catch (error) {
+      checked += 1;
+      await db.transaction(async (tx) => {
+        const transfer = await lockTransfer(tx, candidate.id);
+        await upsertReconciliation(tx, {
+          transferId: transfer.id,
+          providerReference: transfer.providerReference ?? `UNRESOLVED-${transfer.reference}`,
+          expectedAmountMinor: transfer.amountMinor,
+          reportedAmountMinor: null,
+          status: "unknown",
+        });
+        await writeAudit(tx, {
+          actorUserId: null,
+          actorType: "system",
+          action: "provider_reconciliation_unavailable",
+          resource: "transfer",
+          resourceId: transfer.id,
+          requestId: crypto.randomUUID(),
+          metadata: { errorClass: error instanceof Error ? error.name : "unknown" },
+        });
+      });
+      continue;
+    }
+
+    checked += 1;
+    await db.transaction(async (tx) => {
+      const transfer = await lockTransfer(tx, candidate.id);
+      const providerReference = provider.providerReference ?? transfer.providerReference ?? `UNRESOLVED-${transfer.reference}`;
+
+      if (provider.status === "settled") {
+        await settleTransfer(tx, transfer, providerReference, provider.amountMinor ?? transfer.amountMinor);
+        resolved += 1;
+      } else if (provider.status === "failed") {
+        await failTransfer(tx, transfer, providerReference, "provider_reconciled_failed");
+        resolved += 1;
+      } else if (provider.status === "reversed") {
+        if (transfer.status === "settled") {
+          await reverseTransfer(tx, transfer, providerReference);
+          resolved += 1;
+        } else {
+          await upsertReconciliation(tx, {
+            transferId: transfer.id,
+            providerReference,
+            expectedAmountMinor: transfer.amountMinor,
+            reportedAmountMinor: provider.amountMinor ?? null,
+            status: "status_mismatch",
+          });
+        }
+      } else {
+        if (transfer.status === "unknown" && provider.status === "processing") {
+          assertAllowedTransition("unknown", "processing");
+          await tx.update(transfers).set({
+            status: "processing",
+            providerReference,
+            unknownAt: null,
+            unknownReason: null,
+            updatedAt: new Date(),
+          }).where(eq(transfers.id, transfer.id));
+        }
+        await upsertReconciliation(tx, {
+          transferId: transfer.id,
+          providerReference,
+          expectedAmountMinor: transfer.amountMinor,
+          reportedAmountMinor: provider.amountMinor ?? null,
+          status: "unknown",
+        });
+      }
+
+      await writeAudit(tx, {
+        actorUserId: null,
+        actorType: "system",
+        action: "provider_reconciliation_checked",
+        resource: "transfer",
+        resourceId: transfer.id,
+        requestId: crypto.randomUUID(),
+        metadata: { providerStatus: provider.status, providerReference },
+      });
+    });
+  }
+
+  return { checked, resolved };
 }
 
 export async function createPaymentRequest(userId: number, input: {

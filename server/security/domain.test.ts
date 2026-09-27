@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
+  assertDeviceEligibleForTrust,
   assertDistinctPin,
   assertOtp,
   assertPin,
   assertSandboxDailyLimit,
   assertSandboxTransferWithinSingleLimit,
+  assertTrustedDeviceState,
   createOtpCode,
+  deviceTrustEligibleAt,
   hashSecret,
   isExpired,
   nextPinFailureState,
@@ -55,5 +58,16 @@ describe("sandbox identity primitives", () => {
     expect(() => assertSandboxTransferWithinSingleLimit(SANDBOX_SECURITY_POLICY.maxSingleTransferMinor + 1)).toThrow("límite");
     expect(() => assertSandboxDailyLimit(SANDBOX_SECURITY_POLICY.maxDailyOutgoingMinor - 100, 100)).not.toThrow();
     expect(() => assertSandboxDailyLimit(SANDBOX_SECURITY_POLICY.maxDailyOutgoingMinor - 100, 101)).toThrow("límite");
+  });
+
+  it("does not trust a device immediately and enforces a cooling period", () => {
+    const requestedAt = new Date("2026-09-26T12:00:00.000Z");
+    const eligibleAt = deviceTrustEligibleAt(requestedAt);
+    expect(eligibleAt.getTime() - requestedAt.getTime()).toBe(SANDBOX_SECURITY_POLICY.deviceTrustCoolingPeriodMs);
+    expect(() => assertDeviceEligibleForTrust(eligibleAt, new Date("2026-09-26T12:30:00.000Z"))).toThrow("enfriamiento");
+    expect(() => assertDeviceEligibleForTrust(eligibleAt, new Date("2026-09-26T13:00:00.000Z"))).not.toThrow();
+    expect(() => assertTrustedDeviceState("new")).toThrow("confiable");
+    expect(() => assertTrustedDeviceState("pending")).toThrow("confiable");
+    expect(() => assertTrustedDeviceState("trusted")).not.toThrow();
   });
 });
