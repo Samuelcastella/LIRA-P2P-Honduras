@@ -66,8 +66,9 @@ Revise siempre el SQL generado antes de aplicarlo. La migración más reciente, 
 ## Documentación y skills
 
 - [Auditoría de preparación bancaria](docs/bank-readiness/audit-report.md)
+- [Roadmap hacia un piloto real](docs/bank-readiness/roadmap.md)
 - [Controles de identidad del sandbox](docs/bank-readiness/security/sandbox-identity-controls.md)
-- [Evidencia de verificación más reciente](docs/bank-readiness/evidence/verification-2026-09-26.md)
+- [Evidencia de verificación más reciente](docs/bank-readiness/evidence/verification-2026-09-27.md)
 - [Skill de auditoría bancaria](skills/bank-readiness-audit/SKILL.md)
 - [Skill de mejora de seguridad financiera](skills/financial-sandbox-security-upgrade/SKILL.md)
 

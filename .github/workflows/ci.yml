@@ -42,3 +42,82 @@ jobs:
 
       - name: Audit production dependencies
         run: pnpm audit --prod --audit-level=high
+
+  hardened-backend:
+    name: Validate hardened v2 archive against a real Postgres
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Closes bank-readiness finding BR-004 ("no database integration
+    # tests"): every push now actually runs the worker/reconciliation
+    # resilience logic and the audit-immutability trigger against a real
+    # Postgres, not just a type check.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: lira
+          POSTGRES_PASSWORD: lira
+          POSTGRES_DB: lira_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U lira"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://lira:lira@localhost:5432/lira_ci
+      REDIS_URL: redis://localhost:6379
+      LIRA_SANDBOX_ONLY: "true"
+      LIRA_REAL_MONEY_ENABLED: "false"
+      JWT_SECRET: ci-only-not-a-real-secret-ci-only-not-a-real-secret
+      SANDBOX_PROVIDER_WEBHOOK_SECRET: ci-only-not-a-real-secret-ci-only-not-a-real-secret
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Verify hardened source archive checksum
+        run: sha256sum -c lira-p2p-honduras-hardened-v2.sha256
+
+      - name: Extract hardened source archive
+        run: unzip -q lira-p2p-honduras-hardened-v2.zip -d hardened
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.4.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: hardened/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: hardened
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Apply migrations to the CI database
+        working-directory: hardened
+        run: node scripts/migrate.mjs
+
+      - name: Verify audit_events immutability
+        working-directory: hardened
+        run: node scripts/verify-audit-immutability.mjs
+
+      - name: Verify worker retry/dead-letter and reconciliation escalation
+        working-directory: hardened
+        run: pnpm exec tsx scripts/verify-worker-reconciliation.mts
+
+      - name: Typecheck
+        working-directory: hardened
+        run: pnpm check
+
+      - name: Unit tests
+        working-directory: hardened
+        run: pnpm test
+
+      - name: Build all services
+        working-directory: hardened
+        run: pnpm build:api && pnpm build:worker && pnpm build:reconciliation && pnpm build:web
