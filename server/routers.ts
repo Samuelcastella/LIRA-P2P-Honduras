@@ -105,8 +105,8 @@ export const appRouter = router({
   security: router({
     overview: protectedProcedure.input(securityContextInput).query(async ({ ctx, input }) => {
       try {
-        const overview = await getSecurityOverview(ctx.user.id, input);
         const current = await getCurrentDeviceTrust(ctx.user.id, input);
+        const overview = await getSecurityOverview(ctx.user.id, input);
         return {
           ...overview,
           currentDeviceStatus: current.status,
