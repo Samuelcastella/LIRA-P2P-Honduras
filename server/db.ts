@@ -954,30 +954,64 @@ export async function createSandboxTransfer(userId: number, input: Omit<Transfer
   });
 }
 
+const MAX_DISPATCH_ATTEMPTS = Number(process.env.LIRA_OUTBOX_MAX_ATTEMPTS ?? 5);
+const DISPATCH_RETRY_BACKOFF_MS = Number(process.env.LIRA_OUTBOX_RETRY_BACKOFF_MS ?? 30_000);
+
+if (!Number.isInteger(MAX_DISPATCH_ATTEMPTS) || MAX_DISPATCH_ATTEMPTS < 1 || MAX_DISPATCH_ATTEMPTS > 100) {
+  throw new Error("LIRA_OUTBOX_MAX_ATTEMPTS must be an integer between 1 and 100");
+}
+if (!Number.isInteger(DISPATCH_RETRY_BACKOFF_MS) || DISPATCH_RETRY_BACKOFF_MS < 0 || DISPATCH_RETRY_BACKOFF_MS > 86_400_000) {
+  throw new Error("LIRA_OUTBOX_RETRY_BACKOFF_MS must be an integer between 0 and 86400000");
+}
+
 export async function dispatchPendingSandboxOutbox(limit = 20) {
   const db = requiredDb(await getDb());
   const adapter = new SandboxBankAdapter();
+  const retryCutoff = new Date(Date.now() - DISPATCH_RETRY_BACKOFF_MS);
   const pending = await db.select().from(outboxEvents)
-    .where(and(eq(outboxEvents.status, "pending"), eq(outboxEvents.eventType, "provider.transfer.requested")))
+    .where(and(
+      eq(outboxEvents.eventType, "provider.transfer.requested"),
+      or(
+        eq(outboxEvents.status, "pending"),
+        and(
+          eq(outboxEvents.status, "unknown"),
+          lt(outboxEvents.updatedAt, retryCutoff),
+          lt(outboxEvents.attemptCount, MAX_DISPATCH_ATTEMPTS),
+        ),
+      ),
+    ))
     .orderBy(outboxEvents.createdAt)
     .limit(limit);
 
   let dispatched = 0;
   let unknown = 0;
+  let deadLettered = 0;
 
-  for (const event of pending) {
+  for (const candidateEvent of pending) {
     const claimed = await db.transaction(async (tx) => {
-      const claim = await tx.update(outboxEvents).set({
+      const [event] = await tx.update(outboxEvents).set({
         status: "dispatching",
         claimedAt: new Date(),
         attemptCount: sql`${outboxEvents.attemptCount} + 1`,
         failureCode: null,
         updatedAt: new Date(),
-      }).where(and(eq(outboxEvents.id, event.id), eq(outboxEvents.status, "pending"))).returning({ id: outboxEvents.id });
-      if (claim.length !== 1) return null;
+      }).where(and(
+        eq(outboxEvents.id, candidateEvent.id),
+        eq(outboxEvents.eventType, "provider.transfer.requested"),
+        or(
+          eq(outboxEvents.status, "pending"),
+          and(
+            eq(outboxEvents.status, "unknown"),
+            lt(outboxEvents.updatedAt, retryCutoff),
+            lt(outboxEvents.attemptCount, MAX_DISPATCH_ATTEMPTS),
+          ),
+        ),
+      )).returning();
 
-      const [candidate] = await tx.select().from(transfers).where(eq(transfers.id, event.aggregateId)).limit(1);
-      if (!candidate || candidate.status !== "processing") {
+      if (!event) return null;
+
+      const [candidateTransfer] = await tx.select().from(transfers).where(eq(transfers.id, event.aggregateId)).limit(1);
+      if (!candidateTransfer || (candidateTransfer.status !== "processing" && candidateTransfer.status !== "unknown")) {
         await tx.update(outboxEvents).set({
           status: "failed",
           failureCode: "transfer_not_dispatchable",
@@ -985,22 +1019,29 @@ export async function dispatchPendingSandboxOutbox(limit = 20) {
         }).where(eq(outboxEvents.id, event.id));
         return null;
       }
-      const transfer = await lockTransfer(tx, candidate.id);
-      await tx.update(transfers).set({ providerSubmittedAt: new Date(), updatedAt: new Date() }).where(eq(transfers.id, transfer.id));
-      return transfer;
+
+      const transfer = await lockTransfer(tx, candidateTransfer.id);
+      await tx.update(transfers).set({
+        providerSubmittedAt: new Date(),
+        updatedAt: new Date(),
+      }).where(eq(transfers.id, transfer.id));
+
+      return { event, transfer };
     });
+
     if (!claimed) continue;
+    const { event, transfer } = claimed;
 
     try {
       const providerResult = await adapter.createTransfer({
-        transferReference: claimed.reference,
-        amountMinor: claimed.amountMinor,
+        transferReference: transfer.reference,
+        amountMinor: transfer.amountMinor,
         currency: "HNL",
-        idempotencyKey: claimed.idempotencyKey,
+        idempotencyKey: transfer.idempotencyKey,
       });
 
       await db.transaction(async (tx) => {
-        const current = await lockTransfer(tx, claimed.id);
+        const current = await lockTransfer(tx, transfer.id);
         if (current.status !== "processing" && current.status !== "unknown") {
           await tx.update(outboxEvents).set({
             status: "failed",
@@ -1033,27 +1074,45 @@ export async function dispatchPendingSandboxOutbox(limit = 20) {
           resource: "transfer",
           resourceId: current.id,
           requestId: event.id,
-          metadata: { provider: adapter.name, providerReference: providerResult.providerReference },
+          metadata: {
+            provider: adapter.name,
+            providerReference: providerResult.providerReference,
+            attempt: event.attemptCount,
+          },
         });
       });
       dispatched += 1;
     } catch (error) {
+      const exhausted = event.attemptCount >= MAX_DISPATCH_ATTEMPTS;
+      let terminalized = false;
+
       await db.transaction(async (tx) => {
-        const current = await lockTransfer(tx, claimed.id);
+        const current = await lockTransfer(tx, transfer.id);
+        if (current.status !== "processing" && current.status !== "unknown") {
+          await tx.update(outboxEvents).set({
+            status: "failed",
+            failureCode: "transfer_not_dispatchable_after_provider_error",
+            updatedAt: new Date(),
+          }).where(eq(outboxEvents.id, event.id));
+          return;
+        }
+
         if (current.status === "processing") {
           assertAllowedTransition("processing", "unknown");
           await tx.update(transfers).set({
             status: "unknown",
-            unknownAt: new Date(),
+            unknownAt: current.unknownAt ?? new Date(),
             unknownReason: "provider_submission_outcome_unknown",
             updatedAt: new Date(),
           }).where(eq(transfers.id, current.id));
         }
+
         await tx.update(outboxEvents).set({
-          status: "unknown",
-          failureCode: "provider_submission_outcome_unknown",
+          status: exhausted ? "dead_letter" : "unknown",
+          failureCode: exhausted ? "provider_submission_dead_letter" : "provider_submission_outcome_unknown",
           updatedAt: new Date(),
         }).where(eq(outboxEvents.id, event.id));
+
         await upsertReconciliation(tx, {
           transferId: current.id,
           providerReference: current.providerReference ?? `UNRESOLVED-${current.reference}`,
@@ -1061,22 +1120,57 @@ export async function dispatchPendingSandboxOutbox(limit = 20) {
           reportedAmountMinor: null,
           status: "unknown",
         });
-        await writeAudit(tx, {
-          actorUserId: null,
-          actorType: "system",
-          action: "provider_dispatch_unknown",
-          resource: "transfer",
-          resourceId: current.id,
-          requestId: event.id,
-          metadata: { provider: adapter.name, errorClass: error instanceof Error ? error.name : "unknown" },
-        });
+
+        if (exhausted) {
+          await tx.insert(riskEvents).values({
+            id: crypto.randomUUID(),
+            userId: current.senderUserId,
+            transferId: current.id,
+            rule: "outbox_dispatch_dead_letter",
+            score: 90,
+            severity: "high",
+            decision: "review",
+            policyVersion: "sandbox-v2",
+          });
+          await writeAudit(tx, {
+            actorUserId: null,
+            actorType: "system",
+            action: "provider_dispatch_dead_lettered",
+            resource: "transfer",
+            resourceId: current.id,
+            requestId: event.id,
+            metadata: {
+              provider: adapter.name,
+              attempts: event.attemptCount,
+              errorClass: error instanceof Error ? error.name : "unknown",
+            },
+          });
+          terminalized = true;
+        } else {
+          await writeAudit(tx, {
+            actorUserId: null,
+            actorType: "system",
+            action: "provider_dispatch_unknown",
+            resource: "transfer",
+            resourceId: current.id,
+            requestId: event.id,
+            metadata: {
+              provider: adapter.name,
+              attempt: event.attemptCount,
+              errorClass: error instanceof Error ? error.name : "unknown",
+            },
+          });
+        }
       });
-      unknown += 1;
+
+      if (terminalized) deadLettered += 1;
+      else if (!exhausted) unknown += 1;
     }
   }
 
-  return { dispatched, unknown };
+  return { dispatched, unknown, deadLettered };
 }
+
 
 export async function processVerifiedProviderWebhook(webhook: ProviderWebhook, payloadHash: string) {
   const db = requiredDb(await getDb());
@@ -1214,6 +1308,51 @@ export async function processVerifiedProviderWebhook(webhook: ProviderWebhook, p
   });
 }
 
+const RECONCILIATION_STALE_MS = Number(process.env.LIRA_RECONCILIATION_STALE_MS ?? 15 * 60_000);
+const RECONCILIATION_STALE_ESCALATION_RULE = "reconciliation_stale_unresolved";
+
+if (!Number.isInteger(RECONCILIATION_STALE_MS) || RECONCILIATION_STALE_MS < 0 || RECONCILIATION_STALE_MS > 7 * 24 * 60 * 60_000) {
+  throw new Error("LIRA_RECONCILIATION_STALE_MS must be an integer between 0 and 604800000");
+}
+
+async function maybeEscalateStaleReconciliation(tx: any, transfer: any, providerStatus: string) {
+  const stuckSince = transfer.unknownAt ?? transfer.providerSubmittedAt ?? transfer.createdAt;
+  if (!(stuckSince instanceof Date)) return false;
+
+  const stuckForMs = Date.now() - stuckSince.getTime();
+  if (stuckForMs <= RECONCILIATION_STALE_MS) return false;
+
+  const [alreadyEscalated] = await tx.select({ id: riskEvents.id }).from(riskEvents)
+    .where(and(
+      eq(riskEvents.transferId, transfer.id),
+      eq(riskEvents.rule, RECONCILIATION_STALE_ESCALATION_RULE),
+    ))
+    .limit(1);
+
+  if (alreadyEscalated) return false;
+
+  await tx.insert(riskEvents).values({
+    id: crypto.randomUUID(),
+    userId: transfer.senderUserId,
+    transferId: transfer.id,
+    rule: RECONCILIATION_STALE_ESCALATION_RULE,
+    score: 85,
+    severity: "high",
+    decision: "review",
+    policyVersion: "sandbox-v2",
+  });
+  await writeAudit(tx, {
+    actorUserId: null,
+    actorType: "system",
+    action: "reconciliation_escalated",
+    resource: "transfer",
+    resourceId: transfer.id,
+    requestId: crypto.randomUUID(),
+    metadata: { stuckForMs, providerStatus },
+  });
+  return true;
+}
+
 export async function reconcilePendingSandboxTransfers(limit = 50) {
   const db = requiredDb(await getDb());
   const adapter = new SandboxBankAdapter();
@@ -1224,6 +1363,7 @@ export async function reconcilePendingSandboxTransfers(limit = 50) {
 
   let checked = 0;
   let resolved = 0;
+  let escalated = 0;
 
   for (const candidate of candidates) {
     let provider;
@@ -1246,6 +1386,9 @@ export async function reconcilePendingSandboxTransfers(limit = 50) {
           reportedAmountMinor: null,
           status: "unknown",
         });
+        if (await maybeEscalateStaleReconciliation(tx, transfer, "unavailable")) {
+          escalated += 1;
+        }
         await writeAudit(tx, {
           actorUserId: null,
           actorType: "system",
@@ -1301,6 +1444,9 @@ export async function reconcilePendingSandboxTransfers(limit = 50) {
           reportedAmountMinor: provider.amountMinor ?? null,
           status: "unknown",
         });
+        if (await maybeEscalateStaleReconciliation(tx, transfer, provider.status)) {
+          escalated += 1;
+        }
       }
 
       await writeAudit(tx, {
@@ -1315,8 +1461,9 @@ export async function reconcilePendingSandboxTransfers(limit = 50) {
     });
   }
 
-  return { checked, resolved };
+  return { checked, resolved, escalated };
 }
+
 
 export async function createPaymentRequest(userId: number, input: {
   amountMinor: number;
