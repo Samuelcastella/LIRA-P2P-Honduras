@@ -32,6 +32,18 @@ function zipRead(file) {
   }
 }
 
+function zipEntries() {
+  try {
+    return execFileSync("unzip", ["-Z1", reconciliation.baselineArtifact], {
+      encoding: "utf8",
+      maxBuffer: 16 * 1024 * 1024,
+    }).split(/\r?\n/).filter(Boolean);
+  } catch {
+    fail(`unable to list ${reconciliation.baselineArtifact}`);
+    return [];
+  }
+}
+
 function detectSchemaDialect(source) {
   if (/\bmysqlTable\b/.test(source)) return "mysql";
   if (/\bpgTable\b/.test(source)) return "postgresql";
@@ -50,6 +62,9 @@ if (!fs.existsSync(reconciliation.baselineArtifact)) {
 if (deployment.principles?.sandboxOnly !== true || deployment.principles?.realMoneyEnabled !== false) {
   fail("deployment must remain sandbox-only while backend reconciliation is incomplete");
 }
+
+const baselineEntries = zipEntries();
+const baselineServiceSourceFiles = baselineEntries.filter((entry) => /^(services|src\/services)\/(api|worker|reconciliation)\//.test(entry));
 
 const rootPackage = JSON.parse(read("package.json"));
 const baselinePackage = JSON.parse(zipRead("package.json"));
@@ -177,6 +192,7 @@ console.log(JSON.stringify({
   baselineBackendScripts,
   canonicalBackendScripts,
   serviceTopologyStatus: reconciliation.serviceTopology?.status ?? null,
+  baselineServiceSourceFiles,
 }, null, 2));
 
 if (failures.length) {
