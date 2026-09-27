@@ -224,7 +224,7 @@ export async function getSecurityOverview(userId: number, context: SecurityClien
 export async function setUserPin(userId: number, context: SecurityClientContext, pin: string, currentPin?: string) {
   assertPin(pin);
   const db = requiredDb(await getDb());
-  await db.transaction(async (tx) => {
+  const outcome = await db.transaction(async (tx) => {
     const current = await ensureSecurityContext(tx, userId, context);
     const [profile] = await tx.select().from(userSecurityProfiles).where(eq(userSecurityProfiles.userId, userId)).limit(1);
     if (profile?.lockedUntil && !isExpired(profile.lockedUntil)) throw new Error("El PIN está bloqueado temporalmente por intentos fallidos");
@@ -237,7 +237,7 @@ export async function setUserPin(userId: number, context: SecurityClientContext,
         const next = nextPinFailureState(profile?.failedPinAttempts ?? 0);
         await tx.update(userSecurityProfiles).set(next).where(eq(userSecurityProfiles.userId, userId));
         await writeAudit(tx, { actorUserId: userId, actorType: "user", action: "security_pin_rotation_rejected", resource: "security_profile", resourceId: String(userId), requestId: crypto.randomUUID(), metadata: { reason: "current_pin_invalid" } });
-        throw new Error(next.lockedUntil ? "PIN bloqueado durante 15 minutos por intentos fallidos" : "PIN actual incorrecto");
+        return { ok: false as const, message: next.lockedUntil ? "PIN bloqueado durante 15 minutos por intentos fallidos" : "PIN actual incorrecto" };
       }
     }
     const nextHash = hashSecret(pin);
@@ -250,7 +250,9 @@ export async function setUserPin(userId: number, context: SecurityClientContext,
       ? await tx.update(securitySessions).set({ revokedAt: new Date() }).where(and(eq(securitySessions.userId, userId), ne(securitySessions.id, current.sessionId), sql`${securitySessions.revokedAt} is null`))
       : null;
     await writeAudit(tx, { actorUserId: userId, actorType: "user", action: isRotation ? "security_pin_rotated" : "security_pin_set", resource: "security_profile", resourceId: String(userId), requestId: crypto.randomUUID(), metadata: { method: "scrypt", revokedOtherSessions: Number(revoked?.[0].affectedRows ?? 0), sandbox: true } });
+    return { ok: true as const };
   });
+  if (!outcome.ok) throw new Error(outcome.message);
   return { success: true } as const;
 }
 
@@ -278,7 +280,7 @@ export async function verifyTransferChallenge(userId: number, context: SecurityC
   assertPin(pin);
   assertOtp(code);
   const db = requiredDb(await getDb());
-  return db.transaction(async (tx) => {
+  const outcome = await db.transaction(async (tx) => {
     const current = await ensureSecurityContext(tx, userId, context);
     const [device] = await tx.select().from(trustedDevices).where(eq(trustedDevices.id, current.deviceId)).limit(1);
     if (!device || device.revokedAt) throw new Error("El dispositivo de esta sesión no está activo");
@@ -289,24 +291,26 @@ export async function verifyTransferChallenge(userId: number, context: SecurityC
     if (!verifySecret(pin, profile.pinHash)) {
       const next = nextPinFailureState(profile.failedPinAttempts);
       await tx.update(userSecurityProfiles).set(next).where(eq(userSecurityProfiles.userId, userId));
-      throw new Error(next.lockedUntil ? "PIN bloqueado durante 15 minutos por intentos fallidos" : "PIN incorrecto");
+      return { ok: false as const, message: next.lockedUntil ? "PIN bloqueado durante 15 minutos por intentos fallidos" : "PIN incorrecto" };
     }
     const [challenge] = await tx.select().from(otpChallenges).where(and(eq(otpChallenges.id, challengeId), eq(otpChallenges.userId, userId), eq(otpChallenges.sessionId, current.sessionId), eq(otpChallenges.purpose, "transfer"))).limit(1);
     if (!challenge) throw new Error("El desafío de seguridad no pertenece a esta sesión");
     if (challenge.status !== "issued" || isExpired(challenge.expiresAt)) {
       if (challenge.status === "issued") await tx.update(otpChallenges).set({ status: "expired" }).where(eq(otpChallenges.id, challenge.id));
-      throw new Error("El código expiró o ya fue usado; solicita uno nuevo");
+      return { ok: false as const, message: "El código expiró o ya fue usado; solicita uno nuevo" };
     }
     if (!verifySecret(code, challenge.codeHash)) {
       const attempts = challenge.attempts + 1;
       await tx.update(otpChallenges).set({ attempts, status: attempts >= SANDBOX_SECURITY_POLICY.maxOtpAttempts ? "locked" : "issued" }).where(eq(otpChallenges.id, challenge.id));
-      throw new Error(attempts >= SANDBOX_SECURITY_POLICY.maxOtpAttempts ? "Código bloqueado por demasiados intentos" : "Código de verificación incorrecto");
+      return { ok: false as const, message: attempts >= SANDBOX_SECURITY_POLICY.maxOtpAttempts ? "Código bloqueado por demasiados intentos" : "Código de verificación incorrecto" };
     }
     await tx.update(userSecurityProfiles).set({ failedPinAttempts: 0, lockedUntil: null }).where(eq(userSecurityProfiles.userId, userId));
     await tx.update(otpChallenges).set({ status: "verified", verifiedAt: new Date() }).where(eq(otpChallenges.id, challenge.id));
     await writeAudit(tx, { actorUserId: userId, actorType: "user", action: "transfer_otp_verified", resource: "otp_challenge", resourceId: challenge.id, requestId: challenge.id, metadata: { sessionId: current.sessionId } });
-    return { success: true } as const;
+    return { ok: true as const };
   });
+  if (!outcome.ok) throw new Error(outcome.message);
+  return { success: true } as const;
 }
 
 async function consumeVerifiedTransferChallenge(tx: any, userId: number, sessionFingerprint: string, challengeId: string) {
