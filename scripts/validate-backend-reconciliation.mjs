@@ -64,21 +64,37 @@ if (deployment.principles?.sandboxOnly !== true || deployment.principles?.realMo
 }
 
 const baselineEntries = zipEntries();
-const baselineServiceSourceFiles = baselineEntries.filter((entry) => /^(services|src\/services)\/(api|worker|reconciliation)\//.test(entry));
+const baselineServiceSourceFiles = baselineEntries.filter((entry) => /^(services|src\/services|server\/services)\/(api|worker|reconciliation)\//.test(entry));
 
 const rootPackage = JSON.parse(read("package.json"));
 const baselinePackage = JSON.parse(zipRead("package.json"));
 const requiredBackendScripts = reconciliation.serviceTopology?.requiredCanonicalBuildScripts ?? [];
+const requiredCanonicalSourceFiles = reconciliation.serviceTopology?.requiredCanonicalSourceFiles ?? [];
 const baselineBackendScripts = Object.fromEntries(requiredBackendScripts.map((name) => [name, Boolean(baselinePackage.scripts?.[name])]));
 const canonicalBackendScripts = Object.fromEntries(requiredBackendScripts.map((name) => [name, Boolean(rootPackage.scripts?.[name])]));
+const canonicalServiceSourceFiles = Object.fromEntries(requiredCanonicalSourceFiles.map((file) => [file, fs.existsSync(file)]));
 
 for (const [name, present] of Object.entries(baselineBackendScripts)) {
   if (!present) fail(`hardened baseline unexpectedly lacks required service build script: ${name}`);
 }
-if (reconciliation.canonicalBackendMigrationReady) {
-  for (const [name, present] of Object.entries(canonicalBackendScripts)) {
-    if (!present) fail(`canonical backend migration cannot be ready without build script: ${name}`);
-  }
+for (const [name, present] of Object.entries(canonicalBackendScripts)) {
+  if (!present) fail(`canonical backend is missing required service build script: ${name}`);
+}
+for (const [file, present] of Object.entries(canonicalServiceSourceFiles)) {
+  if (!present) fail(`canonical backend is missing required service source file: ${file}`);
+}
+
+if (fs.existsSync("services/api/index.ts")) {
+  const source = read("services/api/index.ts");
+  requireTokens("canonical API entrypoint", source, ["/healthz", "SIGTERM", "LIRA_REAL_MONEY_ENABLED", "createExpressMiddleware"]);
+}
+if (fs.existsSync("services/worker/index.ts")) {
+  const source = read("services/worker/index.ts");
+  requireTokens("canonical worker entrypoint", source, ["dispatchPendingSandboxOutbox", "/healthz", "SIGTERM", "setInterval", "LIRA_REAL_MONEY_ENABLED"]);
+}
+if (fs.existsSync("services/reconciliation/index.ts")) {
+  const source = read("services/reconciliation/index.ts");
+  requireTokens("canonical reconciliation entrypoint", source, ["reconcilePendingSandboxTransfers", "/healthz", "SIGTERM", "setInterval", "LIRA_REAL_MONEY_ENABLED"]);
 }
 
 const rootSchema = read("drizzle/schema.ts");
@@ -107,6 +123,9 @@ if (!reconciliation.canonicalBackendMigrationReady) {
 } else {
   if (canonicalDialect !== baselineDialect) {
     fail("canonicalBackendMigrationReady cannot be true while database dialects differ");
+  }
+  if (reconciliation.serviceTopology?.status !== "verified") {
+    fail("canonicalBackendMigrationReady cannot be true until service topology status is verified");
   }
 }
 
@@ -162,6 +181,7 @@ for (const token of [
   "createPaymentRequest",
   "consumeVerifiedTransferChallenge",
   "dispatchPendingSandboxOutbox",
+  "reconcilePendingSandboxTransfers",
   "reconciliationItems",
 ]) {
   requireTokens("canonical financial orchestration", rootDb, [token]);
@@ -191,6 +211,7 @@ console.log(JSON.stringify({
   semanticContractsChecked: reconciliation.semanticContracts?.length ?? 0,
   baselineBackendScripts,
   canonicalBackendScripts,
+  canonicalServiceSourceFiles,
   serviceTopologyStatus: reconciliation.serviceTopology?.status ?? null,
   baselineServiceSourceFiles,
 }, null, 2));
