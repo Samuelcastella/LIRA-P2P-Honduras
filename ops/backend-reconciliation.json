@@ -9,7 +9,8 @@
     "status": "blocking"
   },
   "exactParityFiles": [
-    "server/_core/oauth.ts"
+    "server/_core/oauth.ts",
+    "shared/const.ts"
   ],
   "semanticContracts": [
     "sandbox-only",
