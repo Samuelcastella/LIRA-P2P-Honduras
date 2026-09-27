@@ -13,7 +13,7 @@ jobs:
   quality:
     name: Validate sandbox source
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -28,6 +28,16 @@ jobs:
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
 
+      - name: Validate deployment boundaries
+        run: node scripts/validate-deployment-contract.mjs
+
+      - name: Inspect hardened API security contract
+        run: |
+          rm -rf /tmp/lira-hardened
+          unzip -q lira-p2p-honduras-hardened-v2.zip -d /tmp/lira-hardened
+          echo "--- hardened contract matches ---"
+          grep -RInE "enroll[A-Za-z]*Device|trusted.?device|startTransferVerification|createPaymentRequest" /tmp/lira-hardened/server /tmp/lira-hardened/client 2>/dev/null | head -n 160 || true
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -39,6 +49,9 @@ jobs:
 
       - name: Build production bundle
         run: pnpm build
+
+      - name: Build lira-web container
+        run: docker build -f Dockerfile.web -t lira-web-ci .
 
       - name: Audit production dependencies
         run: pnpm audit --prod --audit-level=high
