@@ -21,12 +21,20 @@ Before any deployment of `lira-web`:
 4. The production bundle must build.
 5. The actual `Dockerfile.web` image must build successfully.
 6. Production dependency audit must pass at the configured severity threshold.
-7. The frontend/API contract must be compatible with the currently deployed hardened API.
-8. Sandbox controls remain mandatory; real-money operation is not enabled by this workflow.
+7. The frontend/API contract must be executable-checked against the hardened API baseline.
+8. Drizzle schema, migration journal, and latest snapshot must remain synchronized.
+9. Device-trust changes must preserve the explicit `new → pending → trusted` lifecycle, cooling period, OTP purpose separation, revocation, and restricted-device semantics.
+10. Sandbox controls remain mandatory; real-money operation is not enabled by this workflow.
 
 ## Railway watch patterns
 
 Railway watch patterns must mirror `ops/deployment-contract.json`. Do not add broad root patterns such as `package.json`, `client/**`, or `apps/**` to archive-backed backend services unless their Dockerfiles are intentionally migrated to consume those files and the deployment contract is updated in the same reviewed change.
+
+## Canonical backend migration gate
+
+Root `server/**` and `drizzle/**` changes are reconciliation work until the archive-backed backend services are explicitly migrated. They do not change the currently deployed archive merely because they exist in the repository.
+
+Before changing `lira-api`, `lira-worker`, or `lira-reconciliation` from the hardened archive to canonical root source, verify functional parity, database dialect/migration compatibility, security controls, payment state behavior, provider failure semantics, reconciliation, and rollback. The service Dockerfile, watch patterns, deployment contract, and runbook must change together in one reviewed release.
 
 ## Change discipline
 
