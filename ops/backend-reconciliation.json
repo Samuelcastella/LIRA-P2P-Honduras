@@ -62,7 +62,7 @@
     "restore-drill-verified": "blocked",
     "all-CI-gates-green": "verified",
     "production-postgres-major-verified": "verified",
-    "canonical-deployment-artifacts-verified": "pending"
+    "canonical-deployment-artifacts-verified": "verified"
   },
   "semanticParityFiles": [
     "server/security/domain.ts",
