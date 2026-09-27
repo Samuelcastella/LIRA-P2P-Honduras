@@ -47,13 +47,16 @@ async function tick() {
     counters.resolved += result.resolved;
     counters.escalated += result.escalated;
 
-    operationalLog("lira-reconciliation", "reconciliation_cycle_completed", {
-      durationMs: Date.now() - startedAt,
-      checked: result.checked,
-      resolved: result.resolved,
-      escalated: result.escalated,
-      cycles: counters.cycles,
-    }, result.escalated > 0 ? "warn" : "info");
+    const shouldLogCycle = result.checked > 0 || result.resolved > 0 || result.escalated > 0 || counters.cycles % 10 === 0;
+    if (shouldLogCycle) {
+      operationalLog("lira-reconciliation", "reconciliation_cycle_completed", {
+        durationMs: Date.now() - startedAt,
+        checked: result.checked,
+        resolved: result.resolved,
+        escalated: result.escalated,
+        cycles: counters.cycles,
+      }, result.escalated > 0 ? "warn" : "info");
+    }
   } catch (error) {
     consecutiveFailures += 1;
     counters.tickFailures += 1;
