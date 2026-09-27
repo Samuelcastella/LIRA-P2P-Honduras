@@ -1,0 +1,12 @@
+-- Add a terminal dead_letter status for outbox_events. The worker moves an
+-- event here once it has exhausted LIRA_OUTBOX_MAX_ATTEMPTS dispatch
+-- attempts (see dispatchPendingSandboxOutbox in server/db.ts), instead of
+-- retrying it forever or silently leaving it in `unknown`. A review-severity
+-- risk_events row is raised in the same application transaction that sets
+-- this status, so it surfaces on the admin operations dashboard.
+--
+-- ALTER TYPE ... ADD VALUE is safe inside this migration's own transaction
+-- because the new value is not read or written anywhere else in this same
+-- file (PostgreSQL only forbids using a just-added enum value within the
+-- transaction that added it).
+ALTER TYPE outbox_status ADD VALUE 'dead_letter';
