@@ -6,11 +6,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
  && rm -rf /var/lib/apt/lists/* \
  && corepack enable && corepack prepare pnpm@10.15.1 --activate
 
-COPY package.json pnpm-lock.yaml ./
+# Frozen installs must have the complete pnpm workspace + patch configuration available.
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY patches ./patches
 RUN pnpm install --frozen-lockfile
 
 # Canonical source of truth: build the checked-in frontend directly.
-# Do not unpack the historical hardened ZIP here; that archive remains a baseline artifact only.
+# The hardened ZIP remains a backend baseline artifact and is never unpacked by lira-web.
 COPY . .
 RUN pnpm exec vite build
 
