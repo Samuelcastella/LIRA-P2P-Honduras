@@ -9,6 +9,11 @@ const fail = (message) => {
   failures.push(message);
   console.error(`CUTOVER_READINESS_VIOLATION: ${message}`);
 };
+const requireTokens = (label, source, tokens) => {
+  for (const token of tokens) {
+    if (!source.includes(token)) fail(`${label} is missing required token: ${token}`);
+  }
+};
 
 if (readiness.mode !== "sandbox" || readiness.realMoneyEnabled !== false) {
   fail("cutover readiness must remain sandbox-only with real money disabled");
@@ -29,6 +34,8 @@ const mandatoryGates = [
   "rollbackRunbook",
   "incidentResponseRunbook",
   "observabilityBaseline",
+  "deploymentCiGate",
+  "candidateImageSmoke",
   "backupRecoveryPoint",
   "restoreVerification",
 ];
@@ -58,20 +65,64 @@ if (readiness.cutover?.status === "blocked" && migrationReady) {
   fail("canonicalBackendMigrationReady cannot be true while cutover status is blocked");
 }
 
+if (readiness.canonicalCandidate?.strategy !== "railway-dockerfile-path-switch") {
+  fail("canonical cutover must use the reviewed Railway Dockerfile-path switch strategy");
+}
+if (readiness.canonicalCandidate?.rollbackStrategy !== "restore-archive-dockerfile-path-and-watch-patterns") {
+  fail("canonical cutover must preserve the archive-backed rollback strategy");
+}
+
 for (const service of backendServices) {
   const baseline = readiness.productionBaseline?.services?.[service];
   if (!baseline?.serviceId || !baseline?.dockerfile || !baseline?.healthcheckPath) {
     fail(`production baseline is incomplete for ${service}`);
   }
+
+  const candidate = readiness.canonicalCandidate?.services?.[service];
+  if (!candidate?.dockerfile || !candidate?.healthcheckPath) {
+    fail(`canonical candidate is incomplete for ${service}`);
+    continue;
+  }
+  if (candidate.healthcheckPath !== baseline.healthcheckPath) {
+    fail(`${service} candidate health path must preserve the production contract`);
+  }
+  if (!fs.existsSync(candidate.dockerfile)) {
+    fail(`${service} candidate Dockerfile is missing: ${candidate.dockerfile}`);
+    continue;
+  }
+
+  const dockerfile = fs.readFileSync(candidate.dockerfile, "utf8");
+  requireTokens(`${service} candidate Dockerfile`, dockerfile, [
+    "pnpm install --frozen-lockfile",
+    "pnpm prune --prod",
+    "LIRA_SANDBOX_ONLY=true",
+    "LIRA_REAL_MONEY_ENABLED=false",
+    "USER node",
+  ]);
+  if (dockerfile.includes("lira-p2p-honduras-hardened-v2.zip")) {
+    fail(`${service} candidate Dockerfile must build from canonical source, not the hardened archive`);
+  }
 }
 
-const backupGate = readiness.gates?.backupRecoveryPoint;
-if (backupGate?.status === "verified" && !backupGate.evidence?.trim()) {
-  fail("backupRecoveryPoint cannot be verified without evidence");
+const apiCandidate = readiness.canonicalCandidate?.services?.["lira-api"];
+if (apiCandidate?.preDeployCommand !== "node scripts/migrate.mjs") {
+  fail("canonical API candidate must preserve Railway pre-deploy migrations");
 }
-const restoreGate = readiness.gates?.restoreVerification;
-if (restoreGate?.status === "verified" && !restoreGate.evidence?.trim()) {
-  fail("restoreVerification cannot be verified without evidence");
+if (apiCandidate?.dockerfile && fs.existsSync(apiCandidate.dockerfile)) {
+  requireTokens("lira-api candidate migration assets", fs.readFileSync(apiCandidate.dockerfile, "utf8"), [
+    "/workspace/scripts ./scripts",
+    "/workspace/db ./db",
+  ]);
+}
+if (!fs.existsSync("db/migrations/001_initial_postgres.sql")) {
+  fail("canonical PostgreSQL migration directory is missing");
+}
+
+for (const gate of ["deploymentCiGate", "candidateImageSmoke", "backupRecoveryPoint", "restoreVerification"]) {
+  const item = readiness.gates?.[gate];
+  if (item?.status === "verified" && !item.evidence?.trim()) {
+    fail(`${gate} cannot be verified without evidence`);
+  }
 }
 
 console.log(JSON.stringify({
@@ -79,6 +130,7 @@ console.log(JSON.stringify({
   cutoverStatus: readiness.cutover?.status,
   blockedGates,
   artifactSource: reconciliation.baselineArtifact,
+  candidateStrategy: readiness.canonicalCandidate?.strategy,
 }, null, 2));
 
 if (failures.length) process.exitCode = 1;
