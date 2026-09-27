@@ -78,9 +78,16 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Reject MySQL persistence constructs
+        run: |
+          if grep -RInE 'drizzle-orm/mysql2|drizzle-orm/mysql-core|onDuplicateKeyUpdate|affectedRows|date_sub\\(|"mysql2"' server drizzle package.json drizzle.config.ts; then
+            echo "MySQL-specific persistence construct found in canonical PostgreSQL source" >&2
+            exit 1
+          fi
+
       - name: Verify Drizzle schema and migration snapshot stay synchronized
         env:
-          DATABASE_URL: mysql://ci:ci@127.0.0.1:3306/ci
+          DATABASE_URL: postgresql://ci:ci@127.0.0.1:5432/ci
         run: |
           pnpm exec drizzle-kit generate --name ci_schema_sync
           git diff --exit-code -- drizzle
@@ -103,6 +110,177 @@ jobs:
 
       - name: Audit production dependencies
         run: pnpm audit --prod --audit-level=high
+
+
+  canonical-postgres:
+    name: Validate canonical source against a real Postgres
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: lira
+          POSTGRES_PASSWORD: lira
+          POSTGRES_DB: lira_canonical_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U lira"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://lira:lira@localhost:5432/lira_canonical_ci
+      LIRA_SANDBOX_ONLY: "true"
+      LIRA_REAL_MONEY_ENABLED: "false"
+      JWT_SECRET: ci-only-not-a-real-secret-ci-only-not-a-real-secret
+      SANDBOX_PROVIDER_WEBHOOK_SECRET: ci-only-not-a-real-secret-ci-only-not-a-real-secret
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Apply canonical PostgreSQL migrations
+        run: node scripts/migrate.mjs
+
+      - name: Reapply migrations to prove checksum idempotency
+        run: node scripts/migrate.mjs
+
+      - name: Verify canonical financial database invariants
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import pg from "pg";
+          import crypto from "node:crypto";
+
+          const { Pool } = pg;
+          const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 1 });
+
+          const assert = (condition, message) => {
+            if (!condition) throw new Error(message);
+          };
+
+          const expectFailure = async (fn, message) => {
+            let failed = false;
+            try {
+              await fn();
+            } catch {
+              failed = true;
+            }
+            assert(failed, message);
+          };
+
+          const client = await pool.connect();
+          try {
+            const migrations = await client.query("select count(*)::int as count from lira_schema_migrations");
+            assert(migrations.rows[0].count === 3, "expected exactly three canonical PostgreSQL migrations");
+
+            const deadLetter = await client.query(
+              "select exists(select 1 from pg_enum e join pg_type t on t.oid=e.enumtypid where t.typname='outbox_status' and e.enumlabel='dead_letter') as present",
+            );
+            assert(deadLetter.rows[0].present === true, "outbox dead_letter enum value is missing");
+
+            const control = await client.query(
+              "select enabled from operational_controls where control='transfers_enabled'",
+            );
+            assert(control.rows.length === 1 && control.rows[0].enabled === false, "transfers must fail closed after migration");
+
+            const userOpenId = `ci-${crypto.randomUUID()}`;
+            const user = await client.query(
+              'insert into users ("openId",name,"loginMethod",role) values ($1,$2,$3,$4) returning id',
+              [userOpenId, "CI User", "ci", "user"],
+            );
+            const userId = user.rows[0].id;
+
+            const auditId = crypto.randomUUID();
+            await client.query(
+              'insert into audit_events (id,"actorUserId","actorType",action,resource,"resourceId","requestId","metadataHash") values ($1,$2,$3,$4,$5,$6,$7,$8)',
+              [auditId, userId, "system", "ci_probe", "ci", auditId, crypto.randomUUID(), "0".repeat(64)],
+            );
+            await expectFailure(
+              () => client.query('update audit_events set action=$1 where id=$2', ["mutated", auditId]),
+              "audit_events must reject in-place updates",
+            );
+
+            const debitAccount = `ci-debit-${crypto.randomUUID()}`;
+            const creditAccount = `ci-credit-${crypto.randomUUID()}`;
+            await client.query(
+              'insert into financial_accounts (id,"accountType",currency,status) values ($1,$2,$3,$4),($5,$6,$7,$8)',
+              [debitAccount, "sandbox_clearing", "HNL", "active", creditAccount, "user_wallet", "HNL", "active"],
+            );
+
+            const journalId = crypto.randomUUID();
+            await client.query(
+              'insert into journal_transactions (id,reference,type,status,currency) values ($1,$2,$3,$4,$5)',
+              [journalId, `CI-${crypto.randomUUID()}`, "adjustment", "posted", "HNL"],
+            );
+            await client.query("begin");
+            try {
+              await client.query(
+                'insert into ledger_entries (id,"journalId","accountId",direction,"amountMinor",currency) values ($1,$2,$3,$4,$5,$6),($7,$8,$9,$10,$11,$12)',
+                [
+                  crypto.randomUUID(), journalId, debitAccount, "debit", 100, "HNL",
+                  crypto.randomUUID(), journalId, creditAccount, "credit", 100, "HNL",
+                ],
+              );
+              await client.query("commit");
+            } catch (error) {
+              await client.query("rollback");
+              throw error;
+            }
+
+            await expectFailure(
+              () => client.query('update ledger_entries set "amountMinor"=101 where "journalId"=$1', [journalId]),
+              "ledger entries must reject in-place mutation",
+            );
+
+            const unbalancedJournalId = crypto.randomUUID();
+            await client.query(
+              'insert into journal_transactions (id,reference,type,status,currency) values ($1,$2,$3,$4,$5)',
+              [unbalancedJournalId, `CI-${crypto.randomUUID()}`, "adjustment", "posted", "HNL"],
+            );
+            await client.query("begin");
+            let unbalancedRejected = false;
+            try {
+              await client.query(
+                'insert into ledger_entries (id,"journalId","accountId",direction,"amountMinor",currency) values ($1,$2,$3,$4,$5,$6)',
+                [crypto.randomUUID(), unbalancedJournalId, debitAccount, "debit", 100, "HNL"],
+              );
+              await client.query("commit");
+            } catch {
+              unbalancedRejected = true;
+              try { await client.query("rollback"); } catch {}
+            }
+            assert(unbalancedRejected, "unbalanced journal must fail at transaction commit");
+
+            console.log("Canonical PostgreSQL financial invariants verified.");
+          } finally {
+            client.release();
+            await pool.end();
+          }
+          NODE
+
+      - name: Check types with PostgreSQL runtime configuration
+        run: pnpm check
+
+      - name: Run unit tests with PostgreSQL runtime configuration
+        run: pnpm test
+
+      - name: Build canonical backend services
+        run: pnpm build:api && pnpm build:worker && pnpm build:reconciliation
 
   hardened-backend:
     name: Validate hardened v2 archive against a real Postgres
