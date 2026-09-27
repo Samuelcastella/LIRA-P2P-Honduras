@@ -31,7 +31,7 @@ jobs:
       - name: Validate deployment boundaries
         run: node scripts/validate-deployment-contract.mjs
 
-      - name: Inspect hardened API security contract
+      - name: Inspect hardened API security and auth contracts
         run: |
           rm -rf /tmp/lira-hardened
           unzip -q lira-p2p-honduras-hardened-v2.zip -d /tmp/lira-hardened
@@ -42,9 +42,13 @@ jobs:
           echo "--- hardened payment request implementation ---"
           sed -n '910,970p' /tmp/lira-hardened/server/db.ts
           echo "--- archived client security mutations/flow ---"
-          sed -n '160,280p' /tmp/lira-hardened/client/src/pages/Home.tsx
+          sed -n '160,300p' /tmp/lira-hardened/client/src/pages/Home.tsx
+          echo "--- hardened OAuth server contract ---"
+          sed -n '1,260p' /tmp/lira-hardened/server/_core/oauth.ts 2>/dev/null || true
+          echo "--- hardened OAuth client bootstrap ---"
+          sed -n '1,220p' /tmp/lira-hardened/client/src/const.ts 2>/dev/null || true
           echo "--- hardened contract matches ---"
-          grep -RInE "enroll|device.*trust|trust.*device|cooling|eligibleAt|startTransferVerification|createPaymentRequest" /tmp/lira-hardened/server /tmp/lira-hardened/client 2>/dev/null | head -n 240 || true
+          grep -RInE "enroll|device.*trust|trust.*device|cooling|eligibleAt|startTransferVerification|createPaymentRequest|oauth|app-auth|VITE_APP_ID|VITE_OAUTH" /tmp/lira-hardened/server /tmp/lira-hardened/client 2>/dev/null | head -n 320 || true
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
