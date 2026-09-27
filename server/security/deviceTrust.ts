@@ -84,6 +84,12 @@ async function ensureTrustContext(tx: any, userId: number, context: SecurityClie
     throw new Error("Este dispositivo fue revocado; usa un dispositivo de confianza para continuar");
   }
 
+  if (device.status === "new" && !device.eligibleAt) {
+    const eligibleAt = deviceTrustEligibleAt(device.enrollmentRequestedAt ?? device.createdAt ?? new Date());
+    await tx.update(trustedDevices).set({ eligibleAt, updatedAt: new Date() }).where(eq(trustedDevices.id, device.id));
+    device = { ...device, eligibleAt };
+  }
+
   await tx.update(trustedDevices).set({
     label: context.deviceLabel,
     platform: context.platform,
