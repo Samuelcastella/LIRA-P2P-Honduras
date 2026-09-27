@@ -1,0 +1,63 @@
+name: PostgreSQL canonical type fixes
+
+on:
+  push:
+    branches:
+      - chore/postgres-canonical
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: chore/postgres-canonical
+          fetch-depth: 0
+      - name: Apply targeted PostgreSQL fixes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          replacements = {
+              "server/db.ts": [
+                  ('transfersEnabled: controls[0]?.enabled !== 0,', 'transfersEnabled: controls[0]?.enabled !== false,'),
+                  ('if (control?.enabled === 0) throw new Error("Transfers are temporarily paused by an operational control");', 'if (control?.enabled === false) throw new Error("Transfers are temporarily paused by an operational control");'),
+                  ('sql`${transfers.createdAt} > date_sub(now(), interval 5 minute)`', "sql`${transfers.createdAt} > now() - interval '5 minutes'`"),
+              ],
+              "client/src/pages/Home.tsx": [
+                  ('?.enabled !== 0;', '?.enabled !== false;'),
+              ],
+              "server/routers.ts": [
+                  ('return { request: result.paymentRequest, replayed: result.replayed };', 'return { request: result.request, replayed: result.replayed };'),
+              ],
+          }
+
+          for file_name, pairs in replacements.items():
+              path = Path(file_name)
+              text = path.read_text()
+              for old, new in pairs:
+                  count = text.count(old)
+                  if count != 1:
+                      raise SystemExit(f"{file_name}: expected exactly one match for {old!r}, found {count}")
+                  text = text.replace(old, new)
+              path.write_text(text)
+
+          # Fail closed if any known MySQL runtime patterns survived this port.
+          db = Path("server/db.ts").read_text()
+          forbidden = ["date_sub(", "onDuplicateKeyUpdate", "affectedRows", "drizzle-orm/mysql", "mysql2"]
+          found = [token for token in forbidden if token in db]
+          if found:
+              raise SystemExit(f"MySQL-specific runtime tokens remain in server/db.ts: {found}")
+          PY
+      - name: Remove temporary workflow
+        run: rm .github/workflows/postgres-type-fix.yml
+      - name: Commit fixes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server/db.ts server/routers.ts client/src/pages/Home.tsx .github/workflows/postgres-type-fix.yml
+          git commit -m "fix: complete PostgreSQL runtime compatibility"
+          git push origin HEAD:chore/postgres-canonical
