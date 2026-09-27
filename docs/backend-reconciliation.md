@@ -22,6 +22,7 @@ The root backend is **not yet authorized to replace** the archive-backed API, wo
 | Provider abstraction / signed webhooks / unknown state | present | present | semantic parity gate |
 | Database dialect | PostgreSQL | MySQL | **blocking mismatch** |
 | Backend deployment source | hardened ZIP | root source is reconciliation-only | intentionally archive-backed |
+| Service topology | independent API / worker / reconciliation builds | monolithic root server only | **blocking mismatch** |
 
 ## P0 blocker: database dialect
 
@@ -33,6 +34,12 @@ No backend deployment source may be changed from the hardened ZIP until there is
 2. deliberately migrate the hardened behavior to MySQL, including reviewed schema/data migration, concurrency semantics, indexes, transactions, rollback, and reconciliation evidence.
 
 This decision is architectural and must not be hidden inside a Dockerfile edit.
+
+## P0 blocker: backend service topology
+
+The hardened artifact has independent build targets for `lira-api`, `lira-worker`, and `lira-reconciliation`. The canonical root currently exposes only the monolithic `server/_core/index.ts` build and does not yet provide `build:api`, `build:worker`, or `build:reconciliation` scripts.
+
+Therefore a source cutover cannot be implemented safely by changing Dockerfiles alone. Canonical service entrypoints, lifecycle behavior, health checks, shutdown behavior, worker retry semantics, and reconciliation scheduling must be created and tested first.
 
 ## Automated reconciliation evidence
 
