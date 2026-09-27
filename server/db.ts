@@ -39,6 +39,7 @@ import {
   assertPin,
   assertSandboxDailyLimit,
   assertSandboxTransferWithinSingleLimit,
+  assertTrustedDeviceState,
   createOtpCode,
   hashSecret,
   isExpired,
@@ -171,7 +172,7 @@ async function ensureSecurityContext(db: any, userId: number, context: SecurityC
     await db.insert(trustedDevices).values({ id: deviceId, userId, fingerprintHash: deviceFingerprintHash, label: context.deviceLabel, platform: context.platform });
     [device] = await db.select().from(trustedDevices).where(eq(trustedDevices.id, deviceId)).limit(1);
   }
-  if (!device || device.revokedAt) throw new Error("Este dispositivo fue revocado; usa un dispositivo de confianza para continuar");
+  if (!device || device.revokedAt || device.status === "revoked") throw new Error("Este dispositivo fue revocado; usa un dispositivo de confianza para continuar");
   await db.update(trustedDevices).set({ label: context.deviceLabel, platform: context.platform, lastUsedAt: new Date() }).where(eq(trustedDevices.id, device.id));
 
   let [session] = await db.select().from(securitySessions).where(and(eq(securitySessions.userId, userId), eq(securitySessions.sessionFingerprintHash, sessionFingerprintHash))).limit(1);
@@ -257,6 +258,9 @@ export async function startTransferVerification(userId: number, context: Securit
   const db = requiredDb(await getDb());
   return db.transaction(async (tx) => {
     const current = await ensureSecurityContext(tx, userId, context);
+    const [device] = await tx.select().from(trustedDevices).where(eq(trustedDevices.id, current.deviceId)).limit(1);
+    if (!device || device.revokedAt) throw new Error("El dispositivo de esta sesión no está activo");
+    assertTrustedDeviceState(device.status);
     const [profile] = await tx.select().from(userSecurityProfiles).where(eq(userSecurityProfiles.userId, userId)).limit(1);
     if (!profile?.pinHash) throw new Error("Configura tu PIN de seguridad antes de validar una transferencia");
     if (profile.lockedUntil && !isExpired(profile.lockedUntil)) throw new Error("El PIN está bloqueado temporalmente por intentos fallidos");
@@ -276,6 +280,9 @@ export async function verifyTransferChallenge(userId: number, context: SecurityC
   const db = requiredDb(await getDb());
   return db.transaction(async (tx) => {
     const current = await ensureSecurityContext(tx, userId, context);
+    const [device] = await tx.select().from(trustedDevices).where(eq(trustedDevices.id, current.deviceId)).limit(1);
+    if (!device || device.revokedAt) throw new Error("El dispositivo de esta sesión no está activo");
+    assertTrustedDeviceState(device.status);
     const [profile] = await tx.select().from(userSecurityProfiles).where(eq(userSecurityProfiles.userId, userId)).limit(1);
     if (!profile?.pinHash) throw new Error("Configura un PIN antes de validar transferencias");
     if (profile.lockedUntil && !isExpired(profile.lockedUntil)) throw new Error("El PIN está bloqueado temporalmente por intentos fallidos");
@@ -284,7 +291,7 @@ export async function verifyTransferChallenge(userId: number, context: SecurityC
       await tx.update(userSecurityProfiles).set(next).where(eq(userSecurityProfiles.userId, userId));
       throw new Error(next.lockedUntil ? "PIN bloqueado durante 15 minutos por intentos fallidos" : "PIN incorrecto");
     }
-    const [challenge] = await tx.select().from(otpChallenges).where(and(eq(otpChallenges.id, challengeId), eq(otpChallenges.userId, userId), eq(otpChallenges.sessionId, current.sessionId))).limit(1);
+    const [challenge] = await tx.select().from(otpChallenges).where(and(eq(otpChallenges.id, challengeId), eq(otpChallenges.userId, userId), eq(otpChallenges.sessionId, current.sessionId), eq(otpChallenges.purpose, "transfer"))).limit(1);
     if (!challenge) throw new Error("El desafío de seguridad no pertenece a esta sesión");
     if (challenge.status !== "issued" || isExpired(challenge.expiresAt)) {
       if (challenge.status === "issued") await tx.update(otpChallenges).set({ status: "expired" }).where(eq(otpChallenges.id, challenge.id));
@@ -306,11 +313,15 @@ async function consumeVerifiedTransferChallenge(tx: any, userId: number, session
   const sessionFingerprintHash = securityFingerprint(sessionFingerprint);
   const [session] = await tx.select().from(securitySessions).where(and(eq(securitySessions.userId, userId), eq(securitySessions.sessionFingerprintHash, sessionFingerprintHash))).limit(1);
   if (!session || session.revokedAt) throw new Error("La sesión de seguridad no está activa");
+  const [device] = await tx.select().from(trustedDevices).where(eq(trustedDevices.id, session.deviceId)).limit(1);
+  if (!device || device.revokedAt) throw new Error("El dispositivo de la sesión no está activo");
+  assertTrustedDeviceState(device.status);
   const now = new Date();
   const result = await tx.update(otpChallenges).set({ status: "consumed", consumedAt: now }).where(and(
     eq(otpChallenges.id, challengeId),
     eq(otpChallenges.userId, userId),
     eq(otpChallenges.sessionId, session.id),
+    eq(otpChallenges.purpose, "transfer"),
     eq(otpChallenges.status, "verified"),
     sql`${otpChallenges.expiresAt} > ${now}`,
   ));
@@ -365,7 +376,7 @@ export async function revokeOtherSecuritySessions(userId: number, context: Secur
 export async function revokeTrustedDevice(userId: number, deviceId: string) {
   const db = requiredDb(await getDb());
   await db.transaction(async (tx) => {
-    const result = await tx.update(trustedDevices).set({ revokedAt: new Date() }).where(and(eq(trustedDevices.id, deviceId), eq(trustedDevices.userId, userId), sql`${trustedDevices.revokedAt} is null`));
+    const result = await tx.update(trustedDevices).set({ status: "revoked", revokedAt: new Date(), updatedAt: new Date() }).where(and(eq(trustedDevices.id, deviceId), eq(trustedDevices.userId, userId), sql`${trustedDevices.revokedAt} is null`));
     if (Number(result[0].affectedRows ?? 0) !== 1) throw new Error("El dispositivo no está activo o no pertenece al usuario");
     await tx.update(securitySessions).set({ revokedAt: new Date() }).where(and(eq(securitySessions.deviceId, deviceId), eq(securitySessions.userId, userId), sql`${securitySessions.revokedAt} is null`));
     await writeAudit(tx, { actorUserId: userId, actorType: "user", action: "trusted_device_revoked", resource: "trusted_device", resourceId: deviceId, requestId: deviceId, metadata: {} });
