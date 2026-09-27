@@ -252,12 +252,32 @@ export async function startDeviceEnrollment(userId: number, context: SecurityCli
     if (!profile?.pinHash) throw new Error("Configura tu PIN antes de verificar este dispositivo");
 
     const requestedAt = new Date();
-    const eligibleAt = current.device.eligibleAt ?? deviceTrustEligibleAt(requestedAt);
+    const eligibleAt = current.device.eligibleAt ?? deviceTrustEligibleAt(current.device.enrollmentRequestedAt ?? requestedAt);
     await tx.update(trustedDevices).set({
       status: "pending",
       eligibleAt,
       updatedAt: new Date(),
     }).where(eq(trustedDevices.id, current.device.id));
+
+    if (eligibleAt.getTime() > requestedAt.getTime()) {
+      await writeSecurityAudit(tx, {
+        userId,
+        action: "device_enrollment_cooling_started",
+        resource: "trusted_device",
+        resourceId: current.device.id,
+        requestId: current.device.id,
+        metadata: { eligibleAt: eligibleAt.toISOString() },
+      });
+      return {
+        alreadyTrusted: false as const,
+        coolingDown: true as const,
+        deviceId: current.device.id,
+        eligibleAt,
+        challengeId: null,
+        sandboxCode: null,
+        expiresAt: null,
+      };
+    }
 
     const challenge = await issueChallenge(tx, userId, current.session.id, "device_enrollment");
     await writeSecurityAudit(tx, {
@@ -268,7 +288,7 @@ export async function startDeviceEnrollment(userId: number, context: SecurityCli
       requestId: challenge.challengeId,
       metadata: { eligibleAt: eligibleAt.toISOString() },
     });
-    return { ...challenge, alreadyTrusted: false as const, deviceId: current.device.id, eligibleAt };
+    return { ...challenge, alreadyTrusted: false as const, coolingDown: false as const, deviceId: current.device.id, eligibleAt };
   });
 }
 
