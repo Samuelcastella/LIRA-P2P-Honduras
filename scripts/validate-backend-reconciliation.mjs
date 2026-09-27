@@ -51,6 +51,21 @@ if (deployment.principles?.sandboxOnly !== true || deployment.principles?.realMo
   fail("deployment must remain sandbox-only while backend reconciliation is incomplete");
 }
 
+const rootPackage = JSON.parse(read("package.json"));
+const baselinePackage = JSON.parse(zipRead("package.json"));
+const requiredBackendScripts = reconciliation.serviceTopology?.requiredCanonicalBuildScripts ?? [];
+const baselineBackendScripts = Object.fromEntries(requiredBackendScripts.map((name) => [name, Boolean(baselinePackage.scripts?.[name])]));
+const canonicalBackendScripts = Object.fromEntries(requiredBackendScripts.map((name) => [name, Boolean(rootPackage.scripts?.[name])]));
+
+for (const [name, present] of Object.entries(baselineBackendScripts)) {
+  if (!present) fail(`hardened baseline unexpectedly lacks required service build script: ${name}`);
+}
+if (reconciliation.canonicalBackendMigrationReady) {
+  for (const [name, present] of Object.entries(canonicalBackendScripts)) {
+    if (!present) fail(`canonical backend migration cannot be ready without build script: ${name}`);
+  }
+}
+
 const rootSchema = read("drizzle/schema.ts");
 const baselineSchema = zipRead("drizzle/schema.ts");
 const canonicalDialect = detectSchemaDialect(rootSchema);
@@ -159,6 +174,9 @@ console.log(JSON.stringify({
   backendDeploySource: Object.fromEntries(backendServices.map((service) => [service, deployment.services?.[service]?.artifactSource ?? null])),
   exactParityFiles: reconciliation.exactParityFiles,
   semanticContractsChecked: reconciliation.semanticContracts?.length ?? 0,
+  baselineBackendScripts,
+  canonicalBackendScripts,
+  serviceTopologyStatus: reconciliation.serviceTopology?.status ?? null,
 }, null, 2));
 
 if (failures.length) {
