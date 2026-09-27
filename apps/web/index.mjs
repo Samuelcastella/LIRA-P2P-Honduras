@@ -25,52 +25,69 @@ const mimeTypes = {
   ".woff2": "font/woff2",
 };
 
-function proxyToApi(req, res) {
-  if (!apiBase) {
-    res.writeHead(503, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-    res.end(JSON.stringify({ error: "API_NOT_CONFIGURED" }));
+function writeJson(res, statusCode, payload) {
+  res.writeHead(statusCode, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+  res.end(JSON.stringify(payload));
+}
+
+function parseRelativeTarget(rawTarget) {
+  if (!rawTarget || !rawTarget.startsWith("/") || rawTarget.startsWith("//")) return null;
+  try {
+    return new URL(rawTarget, "http://lira.local");
+  } catch {
+    return null;
+  }
+}
+
+function configuredApiOrigin() {
+  if (!apiBase) return null;
+  try {
+    const parsed = new URL(apiBase);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function proxyToApi(req, res, requestTarget) {
+  const upstream = configuredApiOrigin();
+  if (!upstream) {
+    writeJson(res, 503, { error: apiBase ? "API_URL_INVALID" : "API_NOT_CONFIGURED" });
     return;
   }
 
-  let target;
-  try {
-    target = new URL(req.url || "/", apiBase.endsWith("/") ? apiBase : `${apiBase}/`);
-  } catch {
-    res.writeHead(503, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-    res.end(JSON.stringify({ error: "API_URL_INVALID" }));
-    return;
-  }
+  const target = new URL(upstream.origin);
+  target.pathname = requestTarget.pathname;
+  target.search = requestTarget.search;
 
   const transport = target.protocol === "https:" ? https : http;
+  const { connection: _connection, host: _host, ...forwardHeaders } = req.headers;
   const headers = {
-    ...req.headers,
+    ...forwardHeaders,
     host: target.host,
     "x-forwarded-host": req.headers.host || "",
     "x-forwarded-proto": req.headers["x-forwarded-proto"] || "https",
   };
 
-  const proxyReq = transport.request(
-    target,
-    { method: req.method, headers },
-    (proxyRes) => {
-      res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
-      proxyRes.pipe(res);
-    },
-  );
+  const proxyReq = transport.request(target, { method: req.method, headers }, (proxyRes) => {
+    res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
+    proxyRes.pipe(res);
+  });
 
   proxyReq.on("error", () => {
     if (!res.headersSent) {
-      res.writeHead(502, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+      writeJson(res, 502, { error: "API_UNAVAILABLE" });
+      return;
     }
-    res.end(JSON.stringify({ error: "API_UNAVAILABLE" }));
+    res.end();
   });
 
   req.pipe(proxyReq);
 }
 
-function resolveStaticPath(urlPath) {
-  const rawPath = decodeURIComponent(urlPath.split("?")[0] || "/");
-  const requested = rawPath === "/" ? "/index.html" : rawPath;
+function resolveStaticPath(decodedPath) {
+  const requested = decodedPath === "/" ? "/index.html" : decodedPath;
   const normalized = path.normalize(requested).replace(/^([.][.][/\\])+/, "");
   const candidate = path.resolve(publicDir, `.${normalized.startsWith("/") ? normalized : `/${normalized}`}`);
   if (!candidate.startsWith(`${publicDir}${path.sep}`) && candidate !== publicDir) return null;
@@ -93,20 +110,31 @@ function serveFile(filePath, res, isSpaFallback = false) {
 }
 
 const server = http.createServer((req, res) => {
-  const pathname = new URL(req.url || "/", "http://lira.local").pathname;
-
-  if (pathname === "/health") {
-    res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-    res.end(JSON.stringify({ status: "ok", service: "lira-web" }));
+  const requestTarget = parseRelativeTarget(req.url || "/");
+  if (!requestTarget) {
+    writeJson(res, 400, { error: "INVALID_REQUEST_TARGET" });
     return;
   }
 
-  if (pathname.startsWith("/api/")) {
-    proxyToApi(req, res);
+  let decodedPathname;
+  try {
+    decodedPathname = decodeURIComponent(requestTarget.pathname);
+  } catch {
+    writeJson(res, 400, { error: "INVALID_PATH_ENCODING" });
     return;
   }
 
-  const requested = resolveStaticPath(pathname);
+  if (decodedPathname === "/health") {
+    writeJson(res, 200, { status: "ok", service: "lira-web" });
+    return;
+  }
+
+  if (decodedPathname.startsWith("/api/")) {
+    proxyToApi(req, res, requestTarget);
+    return;
+  }
+
+  const requested = resolveStaticPath(decodedPathname);
   if (requested && existsSync(requested) && statSync(requested).isFile()) {
     serveFile(requested, res);
     return;
@@ -123,5 +151,29 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(port, "0.0.0.0", () => {
-  console.log(`[lira-web] listening on :${port}; apiProxy=${apiBase ? "configured" : "missing"}`);
+  console.log(`[lira-web] listening on :${port}; apiProxy=${configuredApiOrigin() ? "configured" : "missing"}`);
 });
+
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[lira-web] ${signal} received; draining active requests`);
+  const forceExit = setTimeout(() => {
+    console.error("[lira-web] graceful shutdown timed out");
+    server.closeAllConnections?.();
+    process.exit(1);
+  }, 10_000);
+  forceExit.unref();
+
+  server.close((error) => {
+    clearTimeout(forceExit);
+    if (error) {
+      console.error("[lira-web] shutdown error", error);
+      process.exitCode = 1;
+    }
+  });
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
