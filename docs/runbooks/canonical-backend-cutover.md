@@ -52,29 +52,40 @@ All conditions below must be true before the first backend service is switched:
 
 If any precondition is false, stop. Do not "try the deployment and see."
 
-## Change construction
+## Pre-staged canonical deployment artifacts
 
-Do not switch all three Dockerfiles in one merge. Use three independently
-reviewable changes so Railway can be observed between steps:
+Canonical containers are pre-staged under alternate filenames:
 
-1. API canonical Dockerfile change.
-2. Worker canonical Dockerfile change.
-3. Reconciliation canonical Dockerfile change.
+- `Dockerfile.api.canonical`
+- `Dockerfile.worker.canonical`
+- `Dockerfile.reconciliation.canonical`
 
-Each canonical Dockerfile must:
+They are built in CI before cutover. The existing archive-backed Dockerfiles
+remain untouched and remain the rollback target.
 
-- build from repository root;
-- use `pnpm install --frozen-lockfile`;
-- build only the intended service entrypoint;
-- copy only runtime dependencies/artifacts required by that service;
-- run as a non-root user;
-- preserve `NODE_ENV=production`;
-- expose the existing healthcheck port;
-- contain no credentials;
-- preserve the existing service command.
+This avoids using a Git merge itself as the production switch. The actual
+cutover is an explicit Railway configuration change, one service at a time:
 
-The deployment contract and watch patterns are changed only with the service
-whose cutover is being performed.
+1. change that service's `dockerfilePath` to its `.canonical` Dockerfile;
+2. replace its watch patterns with the canonical watch-pattern set recorded in
+   `ops/deployment-contract.json`;
+3. explicitly redeploy only that service;
+4. observe and verify before moving to the next service.
+
+Each canonical Dockerfile:
+
+- builds from repository root;
+- uses `pnpm install --frozen-lockfile`;
+- builds only the intended service entrypoint;
+- prunes development dependencies before the runtime stage;
+- copies only runtime dependencies/artifacts required by that service;
+- runs as a non-root user;
+- preserves `NODE_ENV=production`;
+- exposes the existing healthcheck port;
+- contains no credentials;
+- preserves the existing service command.
+
+Do not overwrite or delete the hardened Dockerfiles during the cutover window.
 
 ## Cutover order
 
@@ -96,26 +107,28 @@ whose cutover is being performed.
 
 Proceed only if API remains healthy.
 
-1. Merge only the worker cutover change.
-2. Wait for Railway `SUCCESS`.
-3. Confirm `/health` returns HTTP 200.
-4. Confirm `dispatch_cycle_completed` structured events appear.
-5. Confirm `consecutiveFailures < 3`.
-6. Confirm there is no unexpected increase in `unknown` or
+1. Update only `lira-worker` to `Dockerfile.worker.canonical` and its canonical watch patterns.
+2. Explicitly redeploy only `lira-worker`.
+3. Wait for Railway `SUCCESS`.
+4. Confirm `/health` returns HTTP 200.
+5. Confirm `dispatch_cycle_completed` structured events appear.
+6. Confirm `consecutiveFailures < 3`.
+7. Confirm there is no unexpected increase in `unknown` or
    `deadLettered`.
-7. If a sandbox transfer is exercised, verify its idempotency and that the
+8. If a sandbox transfer is exercised, verify its idempotency and that the
    provider-intent outbox is processed once.
 
 ### Step 3 — Reconciliation
 
 Proceed only if API and worker remain healthy.
 
-1. Merge only the reconciliation cutover change.
-2. Wait for Railway `SUCCESS`.
-3. Confirm `/health` returns HTTP 200.
-4. Confirm `reconciliation_cycle_completed` events appear.
-5. Confirm `consecutiveFailures < 3`.
-6. Investigate every unexpected `escalated > 0` before declaring success.
+1. Update only `lira-reconciliation` to `Dockerfile.reconciliation.canonical` and its canonical watch patterns.
+2. Explicitly redeploy only `lira-reconciliation`.
+3. Wait for Railway `SUCCESS`.
+4. Confirm `/health` returns HTTP 200.
+5. Confirm `reconciliation_cycle_completed` events appear.
+6. Confirm `consecutiveFailures < 3`.
+7. Investigate every unexpected `escalated > 0` before declaring success.
 
 ## Success criteria
 
@@ -158,13 +171,16 @@ archive is the compatibility baseline, the primary rollback is an application
 rollback:
 
 1. Stop progressing to later services.
-2. Restore the affected Dockerfile/deployment contract to the last hardened
-   archive-backed revision.
-3. Redeploy only the affected service.
-4. Confirm its original healthcheck returns 200.
-5. Confirm no new migration checksum mismatch exists.
-6. Run reconciliation before resuming transfer creation.
-7. Preserve all logs and deployment IDs for incident review.
+2. Set the affected Railway service's `dockerfilePath` back to its hardened
+   Dockerfile (`Dockerfile.api`, `Dockerfile.worker`, or
+   `Dockerfile.reconciliation`).
+3. Restore that service's hardened watch patterns from
+   `ops/deployment-contract.json`.
+4. Explicitly redeploy only the affected service.
+5. Confirm its original healthcheck returns 200.
+6. Confirm no new migration checksum mismatch exists.
+7. Run reconciliation before resuming transfer creation.
+8. Preserve all logs and deployment IDs for incident review.
 
 Do **not** delete migration rows or manually mutate ledger/audit data as part of
 an application rollback.
