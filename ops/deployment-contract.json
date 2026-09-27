@@ -18,6 +18,7 @@
         "pnpm-lock.yaml",
         "pnpm-workspace.yaml",
         "patches/**",
+        "tsconfig.json",
         "vite.config.ts",
         "components.json"
       ]
@@ -25,17 +26,26 @@
     "lira-api": {
       "dockerfile": "Dockerfile.api",
       "artifactSource": "lira-p2p-honduras-hardened-v2.zip",
-      "watchPatterns": ["Dockerfile.api", "lira-p2p-honduras-hardened-v2.zip"]
+      "watchPatterns": [
+        "Dockerfile.api",
+        "lira-p2p-honduras-hardened-v2.zip"
+      ]
     },
     "lira-worker": {
       "dockerfile": "Dockerfile.worker",
       "artifactSource": "lira-p2p-honduras-hardened-v2.zip",
-      "watchPatterns": ["Dockerfile.worker", "lira-p2p-honduras-hardened-v2.zip"]
+      "watchPatterns": [
+        "Dockerfile.worker",
+        "lira-p2p-honduras-hardened-v2.zip"
+      ]
     },
     "lira-reconciliation": {
       "dockerfile": "Dockerfile.reconciliation",
       "artifactSource": "lira-p2p-honduras-hardened-v2.zip",
-      "watchPatterns": ["Dockerfile.reconciliation", "lira-p2p-honduras-hardened-v2.zip"]
+      "watchPatterns": [
+        "Dockerfile.reconciliation",
+        "lira-p2p-honduras-hardened-v2.zip"
+      ]
     }
   }
 }
