@@ -509,6 +509,10 @@ function SecurityView({ securityContext, biometricsEnabled, onToggle }: { securi
   const utils = trpc.useUtils();
   const [currentPin, setCurrentPin] = useState("");
   const [newPin, setNewPin] = useState("");
+  const [deviceEnrollmentChallengeId, setDeviceEnrollmentChallengeId] = useState<string | null>(null);
+  const [deviceEnrollmentSandboxCode, setDeviceEnrollmentSandboxCode] = useState<string | null>(null);
+  const [deviceEnrollmentPin, setDeviceEnrollmentPin] = useState("");
+  const [deviceEnrollmentOtp, setDeviceEnrollmentOtp] = useState("");
   const securityQuery = trpc.security.overview.useQuery(securityContext, { retry: false });
   const setPinMutation = trpc.security.setPin.useMutation({
     onSuccess: async () => {
@@ -534,6 +538,32 @@ function SecurityView({ securityContext, biometricsEnabled, onToggle }: { securi
     onSuccess: async () => { await utils.security.overview.invalidate(); toast.success("Dispositivo de confianza revocado."); },
     onError: (error) => toast.error(error.message),
   });
+  const startDeviceEnrollmentMutation = trpc.security.startDeviceEnrollment.useMutation({
+    onSuccess: async (result) => {
+      if (result.alreadyTrusted) {
+        setDeviceEnrollmentChallengeId(null);
+        setDeviceEnrollmentSandboxCode(null);
+        toast.success("Este dispositivo ya es confiable.");
+      } else {
+        setDeviceEnrollmentChallengeId(result.challengeId);
+        setDeviceEnrollmentSandboxCode(result.sandboxCode);
+        toast.message("Verificación iniciada. Respeta el periodo de enfriamiento antes de completar el enrolamiento.");
+      }
+      await utils.security.overview.invalidate();
+    },
+    onError: (error) => toast.error(error.message),
+  });
+  const verifyDeviceEnrollmentMutation = trpc.security.verifyDeviceEnrollment.useMutation({
+    onSuccess: async () => {
+      setDeviceEnrollmentChallengeId(null);
+      setDeviceEnrollmentSandboxCode(null);
+      setDeviceEnrollmentPin("");
+      setDeviceEnrollmentOtp("");
+      await utils.security.overview.invalidate();
+      toast.success("Dispositivo verificado y marcado como confiable.");
+    },
+    onError: (error) => toast.error(error.message),
+  });
   const overview = securityQuery.data;
   const hasPin = Boolean(overview?.hasPin);
   const limits = overview?.transferLimits;
@@ -545,6 +575,9 @@ function SecurityView({ securityContext, biometricsEnabled, onToggle }: { securi
     transfer_otp_verified: "OTP de transferencia validado",
     security_session_revoked: "Sesión cerrada",
     security_other_sessions_revoked: "Otras sesiones cerradas",
+    trusted_device_discovered: "Dispositivo registrado",
+    device_enrollment_requested: "Verificación de dispositivo solicitada",
+    device_trusted: "Dispositivo marcado como confiable",
     trusted_device_revoked: "Dispositivo revocado",
   }[action] || action.replaceAll("_", " "));
 
@@ -569,8 +602,28 @@ function SecurityView({ securityContext, biometricsEnabled, onToggle }: { securi
         <div className="panel-heading"><div><span className="section-kicker">ACCESO VIGENTE</span><h2>Dispositivos y sesiones</h2></div><button className="link-button" onClick={() => securityQuery.refetch()}><RefreshCw size={15} /> Actualizar</button></div>
         {securityQuery.isLoading ? <div className="security-loading"><RefreshCw className="spin" size={18} /> Cargando controles…</div> : <>
           <div className="device-group-title">DISPOSITIVOS DE CONFIANZA</div>
-          {overview?.devices.map((device) => <div className="device-item" key={device.id}><div className="device-icon"><Smartphone size={21} /></div><div><strong>{device.id === overview.currentDeviceId ? "Este navegador" : device.label}</strong><p>{device.platform} · visto {formattedDate(device.lastUsedAt)}</p></div>{device.revokedAt ? <span className="status-pill status-alert">Revocado</span> : device.id === overview.currentDeviceId ? <span className="status-pill status-complete">Actual</span> : <button className="text-button danger-text" disabled={revokeDeviceMutation.isPending} onClick={() => revokeDeviceMutation.mutate({ deviceId: device.id })}>Revocar</button>}</div>)}
+          {overview?.devices.map((device) => <div className="device-item" key={device.id}><div className="device-icon"><Smartphone size={21} /></div><div><strong>{device.id === overview.currentDeviceId ? "Este navegador" : device.label}</strong><p>{device.platform} · visto {formattedDate(device.lastUsedAt)}</p></div>{device.revokedAt || device.status === "revoked" ? <span className="status-pill status-alert">Revocado</span> : device.status === "trusted" ? <span className="status-pill status-complete">Confiable</span> : device.status === "pending" ? <span className="status-pill status-progress">Pendiente</span> : device.status === "restricted" ? <span className="status-pill status-alert">Restringido</span> : <span className="status-pill status-request">Nuevo</span>}{!device.revokedAt && device.id !== overview.currentDeviceId && <button className="text-button danger-text" disabled={revokeDeviceMutation.isPending} onClick={() => revokeDeviceMutation.mutate({ deviceId: device.id })}>Revocar</button>}</div>)}
           {!overview?.devices.length && <div className="empty-security">Sin dispositivos registrados todavía.</div>}
+          {overview?.currentDeviceStatus !== "trusted" && <div className="security-alert">
+            <ShieldCheck size={17} />
+            <div>
+              <strong>Este dispositivo todavía no puede autorizar transferencias.</strong>
+              <p>Un identificador del navegador solo registra el dispositivo; no lo convierte automáticamente en confiable. Configura tu PIN, solicita la verificación y completa el periodo de enfriamiento antes de activarlo.</p>
+              {overview?.currentDeviceEligibleAt && <small>Elegible a partir de {formattedDate(overview.currentDeviceEligibleAt)}.</small>}
+              <div className="verification-inputs">
+                <label>PIN<input value={deviceEnrollmentPin} onChange={(event) => setDeviceEnrollmentPin(event.target.value.replace(/\D/g, "").slice(0, 6))} inputMode="numeric" autoComplete="current-password" placeholder="••••••" /></label>
+                {deviceEnrollmentChallengeId && <label>Código OTP<input value={deviceEnrollmentOtp} onChange={(event) => setDeviceEnrollmentOtp(event.target.value.replace(/\D/g, "").slice(0, 6))} inputMode="numeric" autoComplete="one-time-code" placeholder="••••••" /></label>}
+              </div>
+              {deviceEnrollmentSandboxCode && <div className="sandbox-otp"><span>CÓDIGO DEMO DEL SANDBOX</span><strong>{deviceEnrollmentSandboxCode}</strong><small>Solo se muestra en este entorno de demostración.</small></div>}
+              <div className="flow-footer">
+                {!deviceEnrollmentChallengeId
+                  ? <button className="secondary-button" disabled={!hasPin || startDeviceEnrollmentMutation.isPending} onClick={() => startDeviceEnrollmentMutation.mutate(securityContext)}>Solicitar verificación</button>
+                  : <button className="primary-button" disabled={deviceEnrollmentPin.length !== 6 || deviceEnrollmentOtp.length !== 6 || verifyDeviceEnrollmentMutation.isPending} onClick={() => verifyDeviceEnrollmentMutation.mutate({ ...securityContext, challengeId: deviceEnrollmentChallengeId, pin: deviceEnrollmentPin, code: deviceEnrollmentOtp })}>Verificar dispositivo</button>}
+              </div>
+              {!hasPin && <small>Primero crea tu PIN de seis dígitos en el panel de la izquierda.</small>}
+            </div>
+          </div>}
+          {overview?.currentDeviceStatus === "trusted" && <div className="security-alert subtle-alert"><CheckCircle2 size={17} /><span>Este dispositivo está marcado como confiable y puede iniciar verificaciones de transferencia.</span></div>}
           <div className="session-heading"><span className="device-group-title">SESIONES DE SEGURIDAD</span>{(overview?.activeSessionCount ?? 0) > 1 && <button className="text-button danger-text" disabled={revokeOtherSessionsMutation.isPending} onClick={() => revokeOtherSessionsMutation.mutate(securityContext)}>Cerrar las demás</button>}</div>
           {overview?.sessions.map((session) => <div className="device-item session-item" key={session.id}><div className="device-icon"><LayoutDashboard size={20} /></div><div><strong>{session.id === overview.currentSessionId ? "Sesión actual" : session.label}</strong><p>Última actividad {formattedDate(session.lastSeenAt)}</p></div>{session.revokedAt ? <span className="status-pill status-alert">Cerrada</span> : session.id === overview.currentSessionId ? <span className="status-pill status-complete">Actual</span> : <button className="text-button danger-text" disabled={revokeSessionMutation.isPending} onClick={() => revokeSessionMutation.mutate({ sessionId: session.id })}>Cerrar</button>}</div>)}
           <div className="security-alert subtle-alert"><ShieldCheck size={17} /><span>Estas acciones revocan el acceso al flujo OTP del sandbox, no la sesión principal de Manus.</span></div>
