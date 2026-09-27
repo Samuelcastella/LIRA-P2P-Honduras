@@ -110,6 +110,7 @@ const expectedWatchPatterns = {
     "shared/**",
     "apps/web/**",
     "Dockerfile.web",
+    ".dockerignore",
     "package.json",
     "pnpm-lock.yaml",
     "pnpm-workspace.yaml",
@@ -120,7 +121,7 @@ const expectedWatchPatterns = {
   ],
   ...Object.fromEntries(archiveServices.map((service) => {
     const serviceContract = contract.services?.[service] ?? {};
-    return [service, [serviceContract.dockerfile, serviceContract.artifactSource]];
+    return [service, [serviceContract.dockerfile, ".dockerignore", serviceContract.artifactSource]];
   })),
 };
 
