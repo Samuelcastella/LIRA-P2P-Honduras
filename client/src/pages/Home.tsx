@@ -544,10 +544,14 @@ function SecurityView({ securityContext, biometricsEnabled, onToggle }: { securi
         setDeviceEnrollmentChallengeId(null);
         setDeviceEnrollmentSandboxCode(null);
         toast.success("Este dispositivo ya es confiable.");
+      } else if (result.coolingDown) {
+        setDeviceEnrollmentChallengeId(null);
+        setDeviceEnrollmentSandboxCode(null);
+        toast.message("El dispositivo quedó pendiente. El código OTP se generará cuando termine el periodo de enfriamiento.");
       } else {
         setDeviceEnrollmentChallengeId(result.challengeId);
         setDeviceEnrollmentSandboxCode(result.sandboxCode);
-        toast.message("Verificación iniciada. Respeta el periodo de enfriamiento antes de completar el enrolamiento.");
+        toast.message("Código OTP generado para verificar este dispositivo.");
       }
       await utils.security.overview.invalidate();
     },
@@ -568,6 +572,7 @@ function SecurityView({ securityContext, biometricsEnabled, onToggle }: { securi
   const hasPin = Boolean(overview?.hasPin);
   const limits = overview?.transferLimits;
   const formattedDate = (value: Date | string | null) => value ? new Date(value).toLocaleString("es-HN", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }) : "—";
+  const deviceCoolingDown = Boolean(overview?.currentDeviceEligibleAt && new Date(overview.currentDeviceEligibleAt).getTime() > Date.now());
   const actionLabel = (action: string) => ({
     security_pin_set: "PIN configurado",
     security_pin_rotated: "PIN actualizado",
@@ -576,6 +581,7 @@ function SecurityView({ securityContext, biometricsEnabled, onToggle }: { securi
     security_session_revoked: "Sesión cerrada",
     security_other_sessions_revoked: "Otras sesiones cerradas",
     trusted_device_discovered: "Dispositivo registrado",
+    device_enrollment_cooling_started: "Periodo de enfriamiento iniciado",
     device_enrollment_requested: "Verificación de dispositivo solicitada",
     device_trusted: "Dispositivo marcado como confiable",
     trusted_device_revoked: "Dispositivo revocado",
@@ -617,10 +623,11 @@ function SecurityView({ securityContext, biometricsEnabled, onToggle }: { securi
               {deviceEnrollmentSandboxCode && <div className="sandbox-otp"><span>CÓDIGO DEMO DEL SANDBOX</span><strong>{deviceEnrollmentSandboxCode}</strong><small>Solo se muestra en este entorno de demostración.</small></div>}
               <div className="flow-footer">
                 {!deviceEnrollmentChallengeId
-                  ? <button className="secondary-button" disabled={!hasPin || startDeviceEnrollmentMutation.isPending} onClick={() => startDeviceEnrollmentMutation.mutate(securityContext)}>Solicitar verificación</button>
+                  ? <button className="secondary-button" disabled={!hasPin || startDeviceEnrollmentMutation.isPending || (overview?.currentDeviceStatus === "pending" && deviceCoolingDown)} onClick={() => startDeviceEnrollmentMutation.mutate(securityContext)}>{overview?.currentDeviceStatus === "pending" ? (deviceCoolingDown ? "En periodo de enfriamiento" : "Generar código OTP") : "Solicitar verificación"}</button>
                   : <button className="primary-button" disabled={deviceEnrollmentPin.length !== 6 || deviceEnrollmentOtp.length !== 6 || verifyDeviceEnrollmentMutation.isPending} onClick={() => verifyDeviceEnrollmentMutation.mutate({ ...securityContext, challengeId: deviceEnrollmentChallengeId, pin: deviceEnrollmentPin, code: deviceEnrollmentOtp })}>Verificar dispositivo</button>}
               </div>
               {!hasPin && <small>Primero crea tu PIN de seis dígitos en el panel de la izquierda.</small>}
+              {hasPin && overview?.currentDeviceStatus === "pending" && deviceCoolingDown && <small>Cuando llegue la hora indicada, pulsa Actualizar y luego genera un código OTP nuevo. No se emiten códigos que vayan a expirar durante la espera.</small>}
             </div>
           </div>}
           {overview?.currentDeviceStatus === "trusted" && <div className="security-alert subtle-alert"><CheckCircle2 size={17} /><span>Este dispositivo está marcado como confiable y puede iniciar verificaciones de transferencia.</span></div>}
