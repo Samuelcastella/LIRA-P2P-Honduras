@@ -35,6 +35,10 @@ jobs:
         run: |
           rm -rf /tmp/lira-hardened
           unzip -q lira-p2p-honduras-hardened-v2.zip -d /tmp/lira-hardened
+          echo "--- hardened security policy ---"
+          sed -n '1,150p' /tmp/lira-hardened/server/security/domain.ts
+          echo "--- hardened trusted device/session/otp schema ---"
+          grep -n -A110 -B10 "trustedDevices\|trusted_devices" /tmp/lira-hardened/drizzle/schema.ts 2>/dev/null | head -n 180 || true
           echo "--- hardened security router ---"
           sed -n '1,180p' /tmp/lira-hardened/server/routers.ts
           echo "--- hardened device enrollment implementation ---"
@@ -48,7 +52,7 @@ jobs:
           echo "--- hardened OAuth client bootstrap ---"
           sed -n '1,220p' /tmp/lira-hardened/client/src/const.ts 2>/dev/null || true
           echo "--- hardened contract matches ---"
-          grep -RInE "enroll|device.*trust|trust.*device|cooling|eligibleAt|startTransferVerification|createPaymentRequest|oauth|app-auth|VITE_APP_ID|VITE_OAUTH" /tmp/lira-hardened/server /tmp/lira-hardened/client 2>/dev/null | head -n 320 || true
+          grep -RInE "enroll|device.*trust|trust.*device|cooling|eligibleAt|startTransferVerification|createPaymentRequest|oauth|app-auth|VITE_APP_ID|VITE_OAUTH" /tmp/lira-hardened/server /tmp/lira-hardened/client 2>/dev/null | head -n 360 || true
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
