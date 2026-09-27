@@ -1,0 +1,145 @@
+name: LIRA Cutover Readiness
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "ops/docker/canonical/**"
+      - "ops/cutover-readiness.json"
+      - "scripts/validate-cutover-readiness.mjs"
+      - "scripts/migrate.mjs"
+      - "db/migrations/**"
+      - "server/**"
+      - "services/**"
+      - "drizzle/**"
+      - "shared/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - ".dockerignore"
+      - ".github/workflows/cutover-readiness.yml"
+  push:
+    branches: [main]
+    paths:
+      - "ops/docker/canonical/**"
+      - "ops/cutover-readiness.json"
+      - "scripts/validate-cutover-readiness.mjs"
+      - "scripts/migrate.mjs"
+      - "db/migrations/**"
+      - "server/**"
+      - "services/**"
+      - "drizzle/**"
+      - "shared/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - ".dockerignore"
+      - ".github/workflows/cutover-readiness.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  candidate-images:
+    name: Build and smoke canonical candidates on PostgreSQL 18
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: lira
+          POSTGRES_PASSWORD: lira
+          POSTGRES_DB: lira_cutover_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U lira"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://lira:lira@127.0.0.1:5432/lira_cutover_ci
+      LIRA_SANDBOX_ONLY: "true"
+      LIRA_REAL_MONEY_ENABLED: "false"
+      JWT_SECRET: ci-only-not-a-real-secret-ci-only-not-a-real-secret
+      SANDBOX_PROVIDER_WEBHOOK_SECRET: ci-only-not-a-real-secret-ci-only-not-a-real-secret
+      OAUTH_SERVER_URL: http://127.0.0.1:3999
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Validate cutover contract before image build
+        run: node scripts/validate-cutover-readiness.mjs
+
+      - name: Build canonical API candidate
+        run: docker build -f ops/docker/canonical/Dockerfile.api -t lira-api-candidate .
+
+      - name: Build canonical Worker candidate
+        run: docker build -f ops/docker/canonical/Dockerfile.worker -t lira-worker-candidate .
+
+      - name: Build canonical Reconciliation candidate
+        run: docker build -f ops/docker/canonical/Dockerfile.reconciliation -t lira-reconciliation-candidate .
+
+      - name: Prove API pre-deploy migrations are present and idempotent
+        run: |
+          docker run --rm --network host \
+            -e DATABASE_URL="$DATABASE_URL" \
+            -e LIRA_SANDBOX_ONLY=true \
+            -e LIRA_REAL_MONEY_ENABLED=false \
+            lira-api-candidate node scripts/migrate.mjs
+          docker run --rm --network host \
+            -e DATABASE_URL="$DATABASE_URL" \
+            -e LIRA_SANDBOX_ONLY=true \
+            -e LIRA_REAL_MONEY_ENABLED=false \
+            lira-api-candidate node scripts/migrate.mjs
+
+      - name: Smoke API on the production readiness path
+        run: |
+          docker run -d --name lira-api-smoke --network host \
+            -e PORT=3101 \
+            -e DATABASE_URL="$DATABASE_URL" \
+            -e JWT_SECRET="$JWT_SECRET" \
+            -e SANDBOX_PROVIDER_WEBHOOK_SECRET="$SANDBOX_PROVIDER_WEBHOOK_SECRET" \
+            -e OAUTH_SERVER_URL="$OAUTH_SERVER_URL" \
+            -e LIRA_SANDBOX_ONLY=true \
+            -e LIRA_REAL_MONEY_ENABLED=false \
+            lira-api-candidate
+          curl --fail --silent --show-error --retry 20 --retry-connrefused --retry-delay 1 http://127.0.0.1:3101/ready
+
+      - name: Smoke Worker on the production health path
+        run: |
+          docker run -d --name lira-worker-smoke --network host \
+            -e PORT=3102 \
+            -e DATABASE_URL="$DATABASE_URL" \
+            -e LIRA_SANDBOX_ONLY=true \
+            -e LIRA_REAL_MONEY_ENABLED=false \
+            lira-worker-candidate
+          curl --fail --silent --show-error --retry 20 --retry-connrefused --retry-delay 1 http://127.0.0.1:3102/health
+
+      - name: Smoke Reconciliation on the production health path
+        run: |
+          docker run -d --name lira-reconciliation-smoke --network host \
+            -e PORT=3103 \
+            -e DATABASE_URL="$DATABASE_URL" \
+            -e LIRA_SANDBOX_ONLY=true \
+            -e LIRA_REAL_MONEY_ENABLED=false \
+            lira-reconciliation-candidate
+          curl --fail --silent --show-error --retry 20 --retry-connrefused --retry-delay 1 http://127.0.0.1:3103/health
+
+      - name: Preserve hardened rollback artifact checksum
+        run: sha256sum -c lira-p2p-honduras-hardened-v2.sha256
+
+      - name: Show candidate logs on failure
+        if: failure()
+        run: |
+          docker logs lira-api-smoke 2>&1 || true
+          docker logs lira-worker-smoke 2>&1 || true
+          docker logs lira-reconciliation-smoke 2>&1 || true
+
+      - name: Clean up smoke containers
+        if: always()
+        run: |
+          docker rm -f lira-api-smoke >/dev/null 2>&1 || true
+          docker rm -f lira-worker-smoke >/dev/null 2>&1 || true
+          docker rm -f lira-reconciliation-smoke >/dev/null 2>&1 || true
