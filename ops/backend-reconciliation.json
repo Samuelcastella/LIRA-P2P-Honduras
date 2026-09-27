@@ -5,8 +5,8 @@
   "canonicalBackendMigrationReady": false,
   "database": {
     "baselineDialect": "postgresql",
-    "canonicalDialect": "mysql",
-    "status": "blocking"
+    "canonicalDialect": "postgresql",
+    "status": "validating"
   },
   "exactParityFiles": [
     "server/_core/oauth.ts",
