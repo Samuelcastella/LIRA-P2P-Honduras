@@ -104,6 +104,46 @@ for (const service of backendServices) {
   }
 
   const docker = read(serviceContract.dockerfile);
+  const candidateDockerfile = serviceContract.canonicalCandidateDockerfile;
+  const candidateWatchPatterns = serviceContract.canonicalWatchPatterns;
+  if (!candidateDockerfile || !fs.existsSync(candidateDockerfile)) {
+    fail(`${service} must declare an existing canonicalCandidateDockerfile before cutover`);
+  } else {
+    const candidate = read(candidateDockerfile);
+    for (const required of ["pnpm install --frozen-lockfile", "pnpm prune --prod", "USER node", "NODE_ENV=production"]) {
+      if (!candidate.includes(required)) {
+        fail(`${service} canonical candidate is missing required build/runtime control: ${required}`);
+      }
+    }
+    if (candidate.includes(reconciliation.baselineArtifact) || /\bunzip\b/.test(candidate)) {
+      fail(`${service} canonical candidate must not depend on the hardened archive`);
+    }
+
+    const serviceEntrypointPattern = service === "lira-api"
+      ? "services/api/**"
+      : service === "lira-worker"
+        ? "services/worker/**"
+        : "services/reconciliation/**";
+    const candidateRequiredPatterns = [
+      candidateDockerfile,
+      serviceEntrypointPattern,
+      "server/**",
+      "shared/**",
+      "drizzle/**",
+      "package.json",
+      "pnpm-lock.yaml",
+      "pnpm-workspace.yaml",
+      "patches/**",
+      "tsconfig.json",
+      "drizzle.config.ts",
+    ];
+    if (service === "lira-api") candidateRequiredPatterns.push("db/**", "scripts/**");
+    for (const pattern of candidateRequiredPatterns) {
+      if (!candidateWatchPatterns?.includes(pattern)) {
+        fail(`${service} canonicalWatchPatterns must include ${pattern}`);
+      }
+    }
+  }
   if (!canonicalCutover) {
     if (serviceContract.artifactSource !== reconciliation.baselineArtifact) {
       fail(`${service} must remain backed by ${reconciliation.baselineArtifact} until canonical cutover is approved`);
