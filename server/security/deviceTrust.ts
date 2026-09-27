@@ -120,6 +120,9 @@ async function ensureTrustContext(tx: any, userId: number, context: SecurityClie
   if (!session || session.revokedAt) {
     throw new Error("Esta sesión fue revocada; inicia una nueva sesión de seguridad");
   }
+  if (session.deviceId !== device.id) {
+    throw new Error("La sesión de seguridad no coincide con este dispositivo; inicia una nueva sesión");
+  }
 
   await tx.update(securitySessions).set({
     label: context.deviceLabel,
