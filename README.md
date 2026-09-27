@@ -1,49 +1,89 @@
-# Lira P2P Honduras
+# LIRA — Pagos P2P en Honduras
 
-Private deployment repository for the Lira Honduras financial sandbox.
+> **Sandbox financiero con datos simulados. No procesa dinero real, no conecta con bancos y no debe emplearse para decisiones financieras ni producción.**
 
-## Deployment baseline
-- Hardened source archive: `lira-p2p-honduras-hardened-v2.zip`
-- SHA-256: `da7ac1eca870285189638812a5bc36bbc6b321637afe7f729c771e3451f84a90` (updated — see "Patches applied" below)
-- Country/currency scope: Honduras / HNL
-- Sandbox only; real-money execution remains disabled.
-- PostgreSQL and Redis are isolated in Railway.
-- Web has no direct database/cache credentials; it proxies to the API.
+LIRA es un prototipo web autenticado para explorar pagos P2P en Honduras con HNL. Esta versión incorpora un ledger de doble entrada, estados explícitos de transferencia, controles de riesgo simulados, verificación PIN + OTP para envíos, gestión de dispositivos y sesiones de seguridad, límites preventivos y documentación de preparación bancaria.
 
-## Hardening included
-- double-entry journals and immutable compensating reversals
-- explicit balance reservations/holds
-- ambiguous provider outcomes use `UNKNOWN` + reconciliation
-- device trust requires fresh authentication, second factor and cooling period
-- PostgreSQL migration with advisory lock/checksum ledger
-- Redis-backed anti-abuse controls on sensitive endpoints
-- separated API / worker / reconciliation / web entrypoints
-- operational kill-switch defaults closed
+## Contenido del repositorio
 
-## Release blockers before real money
-1. Replace prototype/Manus OAuth with an approved production identity architecture.
-2. Regenerate and commit a frozen pnpm lockfile for the PostgreSQL dependency graph.
-3. Pass remote build/typecheck/unit/integration/concurrency/reconciliation suites.
-4. Complete Honduras regulatory classification and regulated-provider agreements.
-5. Complete KYC/AML, incident, safeguarding, consumer-protection and bank-readiness gates.
+```text
+client/                       Interfaz React + Tailwind
+server/                       API Express + tRPC y dominio financiero
+drizzle/                      Esquema MySQL y migraciones
+server/financial/             Ledger, riesgo y adaptador de proveedor sandbox
+server/security/              PIN, OTP, dispositivos y sesiones sandbox
+docs/bank-readiness/          Auditoría, controles, runbooks y evidencia
+skills/                       Skills reutilizables creadas para este proyecto
+Dockerfile.* y archivos ZIP     Artefactos heredados de despliegue, preservados en la raíz
+```
 
-The original `lira-p2p-honduras.zip` is retained as a traceable baseline and is not considered production-ready.
+## Controles implementados en el sandbox
 
-## Patches applied
+- **Ledger de doble entrada:** los saldos se derivan de asientos contables; no existe edición directa de saldo.
+- **Idempotencia y estados:** una clave se limita al usuario, se rechaza un payload distinto con la misma clave y las transiciones de estado se validan en servidor.
+- **Riesgo y operación:** reglas de riesgo simuladas, interruptor administrativo para nuevos envíos y cola transaccional de salida.
+- **Proveedor simulado:** `SandboxBankAdapter` usa eventos firmados, timestamp, deduplicación y conciliación simulada.
+- **PIN y OTP:** secretos con hash scrypt, límites de intentos, caducidad, vínculo de desafío con usuario/sesión y consumo condicional de un solo uso.
+- **Sesiones y dispositivos:** registros por usuario, revocación de dispositivo/sesión y cierre de las demás sesiones al rotar el PIN.
+- **Límites preventivos:** máximo de **L 1,000.00** por envío y reserva diaria UTC de **L 2,000.00**, evaluados en el servidor.
+- **Interfaz explícita:** estados pendiente, rechazado, expirado, fallido, completado y cancelado, junto con alertas y bitácora segura.
 
-Found by running `pnpm check`/`pnpm test`/`pnpm build:*` against the archive before wiring up CI
-(none of these were caught before this archive was pushed):
+## Inicio local
 
-1. `apps/web/index.mjs`'s API proxy referenced an undefined `proxy` variable instead of
-   `upstream` — a `ReferenceError` on the very first `/api/*` request in production.
-2. `client/src/pages/Home.tsx` read `result.paymentRequest.id` after creating a payment request,
-   but `createPaymentRequest` (`server/db.ts`) returns `{ request, replayed }`, not
-   `{ paymentRequest, replayed }` — this threw at runtime on every "solicitar pago" flow.
-3. Same file compared `operationalControls.enabled` (a real `boolean` column) against the number
-   `0` (`!== 0`) instead of `!== false` — a type error that also meant the kill-switch read as
-   permanently "enabled" regardless of its actual value.
+### Requisitos
 
-Repackaged with only these three lines changed (verified: unzip → diff against the previous tree
-shows no other differences). SHA-256 updated above and in `lira-p2p-honduras-hardened-v2.sha256`.
-`pnpm install && pnpm check && pnpm test && pnpm build:api && pnpm build:worker && pnpm
-build:reconciliation && pnpm build:web` all pass against the repackaged archive.
+- Node.js 22
+- pnpm 10
+- Una base MySQL/TiDB para los flujos persistidos
+- Variables de entorno de Manus/WebDev para el inicio de sesión del entorno
+
+```bash
+pnpm install --frozen-lockfile
+pnpm drizzle-kit migrate
+pnpm dev
+```
+
+Para validar la aplicación:
+
+```bash
+pnpm check
+pnpm test
+pnpm build
+pnpm audit --prod
+```
+
+## Migraciones
+
+Las migraciones se generan desde `drizzle/schema.ts`:
+
+```bash
+pnpm drizzle-kit generate
+pnpm drizzle-kit migrate
+```
+
+Revise siempre el SQL generado antes de aplicarlo. La migración más reciente, `0005_nifty_komodo.sql`, añade `daily_transfer_controls` para la reserva atómica de límites diarios del sandbox.
+
+## Documentación y skills
+
+- [Auditoría de preparación bancaria](docs/bank-readiness/audit-report.md)
+- [Controles de identidad del sandbox](docs/bank-readiness/security/sandbox-identity-controls.md)
+- [Evidencia de verificación más reciente](docs/bank-readiness/evidence/verification-2026-09-26.md)
+- [Skill de auditoría bancaria](skills/bank-readiness-audit/SKILL.md)
+- [Skill de mejora de seguridad financiera](skills/financial-sandbox-security-upgrade/SKILL.md)
+
+## Límites deliberados
+
+LIRA sigue clasificado como **NOT_READY** para cualquier piloto con dinero real, integración bancaria o lanzamiento productivo. Entre las brechas deliberadamente abiertas están:
+
+1. OTP solo demostrativo: no hay SMS, correo ni push con entrega verificada.
+2. Identificadores de dispositivos creados en cliente: no hay passkeys/WebAuthn ni atestación independiente.
+3. La revocación se limita al registro de sesión del sandbox; no reemplaza una arquitectura de sesión productiva.
+4. No existe proveedor financiero real, KYC/AML, conciliación contra extractos, observabilidad productiva, recuperación de cuentas ni pruebas de concurrencia contra una base de datos remota.
+
+Consulta la auditoría y los runbooks antes de reutilizar el código fuera de un entorno de demostración.
+
+## Automatización y artefactos heredados
+
+Los Dockerfiles y archivos ZIP históricos se conservan en la raíz por trazabilidad. **No son el código fuente vigente ni deben desplegarse como esta versión de LIRA.**
+
+La automatización heredada de GitHub Actions continúa validando el archivo ZIP histórico. La fuente actual fue validada localmente con instalación reproducible, type check, 16 pruebas, build y auditoría de dependencias. El workflow debe actualizarse para validar la fuente de la raíz cuando la integración de GitHub disponga de permiso `workflows`.
