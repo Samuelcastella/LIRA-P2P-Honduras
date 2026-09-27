@@ -6,6 +6,7 @@ export const TRANSFER_STATES = [
   "risk_review",
   "authorized",
   "processing",
+  "unknown",
   "settled",
   "declined",
   "failed",
@@ -30,6 +31,7 @@ export type TransferIntent = {
 
 export type JournalEntry = {
   id: string;
+  journalId: string;
   transferId: string;
   accountId: string;
   direction: LedgerDirection;
@@ -49,7 +51,7 @@ export type RiskAssessment = {
   rule: string;
   score: number;
   severity: "low" | "medium" | "high";
-  policyVersion: "sandbox-v1";
+  policyVersion: "sandbox-v2";
 };
 
 const transitions: Record<TransferState, readonly TransferState[]> = {
@@ -57,7 +59,8 @@ const transitions: Record<TransferState, readonly TransferState[]> = {
   authenticating: ["risk_review", "declined", "failed"],
   risk_review: ["authorized", "declined", "failed"],
   authorized: ["processing", "canceled", "failed"],
-  processing: ["settled", "failed", "reversed"],
+  processing: ["unknown", "settled", "failed"],
+  unknown: ["processing", "settled", "failed", "reversed"],
   settled: ["reversed"],
   declined: [],
   failed: [],
@@ -104,21 +107,21 @@ export function assertIdempotency(existingFingerprint: string, requestFingerprin
 
 export function evaluateRisk(context: RiskContext): RiskAssessment {
   if ((context.attemptsInFiveMinutes ?? 0) >= 10) {
-    return { decision: "block", rule: "attempt_velocity_limit", score: 100, severity: "high", policyVersion: "sandbox-v1" };
+    return { decision: "block", rule: "attempt_velocity_limit", score: 100, severity: "high", policyVersion: "sandbox-v2" };
   }
   if ((context.distinctRecipientsInHour ?? 0) >= 8) {
-    return { decision: "review", rule: "recipient_velocity_review", score: 75, severity: "high", policyVersion: "sandbox-v1" };
+    return { decision: "review", rule: "recipient_velocity_review", score: 75, severity: "high", policyVersion: "sandbox-v2" };
   }
   if (context.isNewDevice && context.amountMinor >= 500_000) {
-    return { decision: "review", rule: "new_device_high_value", score: 70, severity: "high", policyVersion: "sandbox-v1" };
+    return { decision: "review", rule: "new_device_high_value", score: 70, severity: "high", policyVersion: "sandbox-v2" };
   }
   if (context.amountMinor >= 1_000_000) {
-    return { decision: "challenge", rule: "high_value_challenge", score: 45, severity: "medium", policyVersion: "sandbox-v1" };
+    return { decision: "challenge", rule: "high_value_challenge", score: 45, severity: "medium", policyVersion: "sandbox-v2" };
   }
-  return { decision: "allow", rule: "baseline_allow", score: 5, severity: "low", policyVersion: "sandbox-v1" };
+  return { decision: "allow", rule: "baseline_allow", score: 5, severity: "low", policyVersion: "sandbox-v2" };
 }
 
-export function createBalancedJournal(transferId: string, intent: TransferIntent): JournalEntry[] {
+export function createBalancedJournal(journalId: string, transferId: string, intent: TransferIntent): JournalEntry[] {
   assertPositiveMinorAmount(intent.amountMinor);
   if (intent.sourceAccountId === intent.destinationAccountId) {
     throw new FinancialInvariantError("Source and destination financial accounts must be distinct");
@@ -127,6 +130,7 @@ export function createBalancedJournal(transferId: string, intent: TransferIntent
   return [
     {
       id: randomUUID(),
+      journalId,
       transferId,
       accountId: intent.sourceAccountId,
       direction: "debit",
@@ -135,6 +139,7 @@ export function createBalancedJournal(transferId: string, intent: TransferIntent
     },
     {
       id: randomUUID(),
+      journalId,
       transferId,
       accountId: intent.destinationAccountId,
       direction: "credit",
@@ -144,26 +149,43 @@ export function createBalancedJournal(transferId: string, intent: TransferIntent
   ];
 }
 
+export function createCompensatingJournal(journalId: string, transferId: string, originalEntries: readonly JournalEntry[]): JournalEntry[] {
+  if (originalEntries.length < 2) throw new FinancialInvariantError("A reversal requires the original posted journal entries");
+  const entries = originalEntries.map((entry) => ({
+    id: randomUUID(),
+    journalId,
+    transferId,
+    accountId: entry.accountId,
+    direction: entry.direction === "debit" ? "credit" as const : "debit" as const,
+    amountMinor: entry.amountMinor,
+    currency: entry.currency,
+  }));
+  assertBalancedJournal(entries);
+  return entries;
+}
+
 export function assertBalancedJournal(entries: readonly JournalEntry[]) {
-  if (entries.length !== 2) {
-    throw new FinancialInvariantError("A sandbox transfer must contain exactly one debit and one credit");
+  if (entries.length < 2) throw new FinancialInvariantError("A journal must contain at least two entries");
+  const currency = entries[0]?.currency;
+  let debits = 0;
+  let credits = 0;
+  for (const entry of entries) {
+    assertPositiveMinorAmount(entry.amountMinor);
+    if (entry.currency !== currency) throw new FinancialInvariantError("A journal cannot mix currencies");
+    if (entry.direction === "debit") debits += entry.amountMinor;
+    else credits += entry.amountMinor;
   }
-  const debit = entries.filter((entry) => entry.direction === "debit");
-  const credit = entries.filter((entry) => entry.direction === "credit");
-  if (debit.length !== 1 || credit.length !== 1) {
-    throw new FinancialInvariantError("A transfer must contain exactly one debit and one credit");
-  }
-  if (debit[0].currency !== credit[0].currency || debit[0].amountMinor !== credit[0].amountMinor) {
-    throw new FinancialInvariantError("Debit and credit values must match exactly");
-  }
-  if (debit[0].accountId === credit[0].accountId) {
-    throw new FinancialInvariantError("A transfer cannot debit and credit the same account");
-  }
+  if (debits !== credits) throw new FinancialInvariantError("Debit and credit values must balance exactly");
 }
 
 export function createTransferReference(now = new Date()) {
   const date = now.toISOString().slice(0, 10).replaceAll("-", "");
   return `TX-${date}-${randomUUID().replaceAll("-", "").slice(0, 8).toUpperCase()}`;
+}
+
+export function createJournalReference(prefix: "SET" | "REV" | "SEED" | "ADJ", now = new Date()) {
+  const date = now.toISOString().slice(0, 10).replaceAll("-", "");
+  return `${prefix}-${date}-${randomUUID().replaceAll("-", "").slice(0, 10).toUpperCase()}`;
 }
 
 export function hashAuditMetadata(metadata: Record<string, unknown>) {
