@@ -57,7 +57,7 @@ function proxyToApi(req, res, requestTarget) {
     return;
   }
 
-  const target = new URL(upstream.origin);
+  const target = new URL(upstream.toString());
   target.pathname = requestTarget.pathname;
   target.search = requestTarget.search;
 
