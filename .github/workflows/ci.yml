@@ -116,12 +116,16 @@ jobs:
 
 
   canonical-postgres:
-    name: Validate canonical source against a real Postgres
+    name: Validate canonical source against PostgreSQL ${{ matrix.postgres }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["16", "18"]
     services:
       postgres:
-        image: postgres:16
+        image: postgres:${{ matrix.postgres }}
         env:
           POSTGRES_USER: lira
           POSTGRES_PASSWORD: lira
@@ -289,12 +293,16 @@ jobs:
         run: pnpm build:api && pnpm build:worker && pnpm build:reconciliation
 
   hardened-backend:
-    name: Validate hardened v2 archive against a real Postgres
+    name: Validate hardened v2 archive against PostgreSQL ${{ matrix.postgres }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["16", "18"]
     services:
       postgres:
-        image: postgres:16
+        image: postgres:${{ matrix.postgres }}
         env:
           POSTGRES_USER: lira
           POSTGRES_PASSWORD: lira
