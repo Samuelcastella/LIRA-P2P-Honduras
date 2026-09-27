@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "baselineArtifact": "lira-p2p-honduras-hardened-v2.zip",
+  "canonicalSource": "repository-root",
+  "canonicalBackendMigrationReady": false,
+  "database": {
+    "baselineDialect": "postgresql",
+    "canonicalDialect": "mysql",
+    "status": "blocking"
+  },
+  "exactParityFiles": [
+    "server/security/domain.ts",
+    "server/_core/oauth.ts"
+  ],
+  "semanticContracts": [
+    "sandbox-only",
+    "HNL-minor-units",
+    "idempotency",
+    "double-entry-ledger",
+    "explicit-transfer-state-machine",
+    "risk-decision-recording",
+    "signed-provider-webhooks",
+    "provider-unknown-state",
+    "transactional-outbox",
+    "reconciliation",
+    "payment-request-idempotency",
+    "trusted-device-gate",
+    "OTP-purpose-separation",
+    "immutable-audit-trace"
+  ],
+  "migrationExitCriteria": [
+    "database-dialect-and-migration-strategy-reconciled",
+    "auth-contract-parity-verified",
+    "financial-domain-invariants-verified",
+    "provider-failure-semantics-verified",
+    "reconciliation-parity-verified",
+    "device-trust-and-OTP-parity-verified",
+    "worker-and-reconciliation-entrypoints-verified",
+    "rollback-runbook-verified",
+    "all-CI-gates-green"
+  ]
+}
