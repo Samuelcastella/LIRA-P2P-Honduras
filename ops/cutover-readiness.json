@@ -54,8 +54,8 @@
       "evidence": "Independent API, worker, and reconciliation entrypoints build in CI."
     },
     "canonicalDeploymentArtifacts": {
-      "status": "pending",
-      "evidence": "Canonical alternate Dockerfiles and CI container builds are being prepared; current Railway production remains on hardened Dockerfiles."
+      "status": "verified",
+      "evidence": "GitHub Actions run #105 successfully built Dockerfile.api.canonical, Dockerfile.worker.canonical, and Dockerfile.reconciliation.canonical; deployment-contract candidate validation also passed."
     },
     "healthcheckCompatibility": {
       "status": "verified",
