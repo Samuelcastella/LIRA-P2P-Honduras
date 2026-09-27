@@ -50,7 +50,7 @@
   "serviceTopology": {
     "baseline": "independent-api-worker-reconciliation",
     "canonical": "independent-api-worker-reconciliation",
-    "status": "implemented-pending-ci",
+    "status": "verified",
     "requiredCanonicalBuildScripts": [
       "build:api",
       "build:worker",
