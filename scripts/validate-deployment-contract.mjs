@@ -1,6 +1,7 @@
 import fs from "node:fs";
 
 const contract = JSON.parse(fs.readFileSync("ops/deployment-contract.json", "utf8"));
+const reconciliation = JSON.parse(fs.readFileSync("ops/backend-reconciliation.json", "utf8"));
 const read = (file) => fs.readFileSync(file, "utf8");
 const fail = (message) => {
   console.error(`DEPLOYMENT_CONTRACT_VIOLATION: ${message}`);
@@ -22,41 +23,52 @@ function dockerInstructions(source) {
     .filter((line) => line && !line.startsWith("#"));
 }
 
-function copySources(source) {
+function parseCopySources(instruction) {
+  let rest = instruction.replace(/^COPY\s+/i, "");
+  let fromStage = false;
+
+  while (rest.startsWith("--")) {
+    const match = rest.match(/^(--[^\s]+)\s+(.*)$/);
+    if (!match) break;
+    if (match[1].startsWith("--from=")) fromStage = true;
+    rest = match[2];
+  }
+  if (fromStage) return [];
+
+  if (rest.startsWith("[")) {
+    try {
+      const values = JSON.parse(rest);
+      if (!Array.isArray(values) || values.length < 2 || values.some((value) => typeof value !== "string")) {
+        fail(`invalid JSON COPY instruction: ${instruction}`);
+        return [];
+      }
+      return values.slice(0, -1);
+    } catch {
+      fail(`invalid JSON COPY instruction: ${instruction}`);
+      return [];
+    }
+  }
+
+  const tokens = rest.match(/"[^"]*"|'[^']*'|\S+/g)?.map((token) => token.replace(/^["']|["']$/g, "")) ?? [];
+  if (tokens.length < 2) {
+    fail(`unable to parse COPY instruction: ${instruction}`);
+    return [];
+  }
+  return tokens.slice(0, -1);
+}
+
+function buildContextSources(source, { rejectAdd = false } = {}) {
   const result = [];
   for (const instruction of dockerInstructions(source)) {
-    if (!/^COPY\s+/i.test(instruction)) continue;
-    let rest = instruction.replace(/^COPY\s+/i, "");
-    let fromStage = false;
-
-    while (rest.startsWith("--")) {
-      const match = rest.match(/^(--[^\s]+)\s+(.*)$/);
-      if (!match) break;
-      if (match[1].startsWith("--from=")) fromStage = true;
-      rest = match[2];
-    }
-    if (fromStage) continue;
-
-    if (rest.startsWith("[")) {
-      try {
-        const values = JSON.parse(rest);
-        if (!Array.isArray(values) || values.length < 2 || values.some((value) => typeof value !== "string")) {
-          fail(`invalid JSON COPY instruction: ${instruction}`);
-          continue;
-        }
-        result.push(...values.slice(0, -1));
-      } catch {
-        fail(`invalid JSON COPY instruction: ${instruction}`);
+    if (/^ADD\s+/i.test(instruction)) {
+      if (rejectAdd) {
+        fail(`archive-backed Dockerfile must not use ADD: ${instruction}`);
       }
       continue;
     }
-
-    const tokens = rest.match(/"[^"]*"|'[^']*'|\S+/g)?.map((token) => token.replace(/^["']|["']$/g, "")) ?? [];
-    if (tokens.length < 2) {
-      fail(`unable to parse COPY instruction: ${instruction}`);
-      continue;
+    if (/^COPY\s+/i.test(instruction)) {
+      result.push(...parseCopySources(instruction));
     }
-    result.push(...tokens.slice(0, -1));
   }
   return result;
 }
@@ -78,8 +90,9 @@ for (const requiredBeforeInstall of ["pnpm-workspace.yaml", "COPY patches ./patc
   if (at === -1 || at > installAt) fail(`${requiredBeforeInstall} must be available before frozen install`);
 }
 
-const archiveServices = ["lira-api", "lira-worker", "lira-reconciliation"];
-for (const service of archiveServices) {
+const backendServices = ["lira-api", "lira-worker", "lira-reconciliation"];
+const canonicalCutover = reconciliation.canonicalBackendMigrationReady === true;
+for (const service of backendServices) {
   const serviceContract = contract.services?.[service];
   if (!serviceContract?.dockerfile || !serviceContract?.artifactSource) {
     fail(`${service} must declare dockerfile and artifactSource`);
@@ -89,47 +102,75 @@ for (const service of archiveServices) {
     fail(`${service} declares missing Dockerfile: ${serviceContract.dockerfile}`);
     continue;
   }
-  if (!fs.existsSync(serviceContract.artifactSource)) {
-    fail(`${service} declares missing artifact: ${serviceContract.artifactSource}`);
-  }
 
   const docker = read(serviceContract.dockerfile);
-  const sources = copySources(docker);
-  if (!sources.includes(serviceContract.artifactSource)) {
-    fail(`${service} must copy its declared archive source ${serviceContract.artifactSource}`);
-  }
-  const unexpected = sources.filter((source) => source !== serviceContract.artifactSource);
-  if (unexpected.length) {
-    fail(`${service} archive-backed Dockerfile has undeclared build-context COPY source(s): ${unexpected.join(", ")}`);
+  if (!canonicalCutover) {
+    if (serviceContract.artifactSource !== reconciliation.baselineArtifact) {
+      fail(`${service} must remain backed by ${reconciliation.baselineArtifact} until canonical cutover is approved`);
+      continue;
+    }
+    if (!fs.existsSync(serviceContract.artifactSource)) {
+      fail(`${service} declares missing archive artifact: ${serviceContract.artifactSource}`);
+    }
+    const sources = buildContextSources(docker, { rejectAdd: true });
+    if (!sources.includes(serviceContract.artifactSource)) {
+      fail(`${service} must COPY its declared archive source ${serviceContract.artifactSource}`);
+    }
+    const unexpected = sources.filter((source) => source !== serviceContract.artifactSource);
+    if (unexpected.length) {
+      fail(`${service} archive-backed Dockerfile has undeclared build-context COPY source(s): ${unexpected.join(", ")}`);
+    }
+  } else {
+    if (serviceContract.artifactSource !== "canonical-repository") {
+      fail(`${service} must declare canonical-repository after canonical backend migration is approved`);
+    }
+    if (docker.includes(reconciliation.baselineArtifact) || /\bunzip\b/.test(docker)) {
+      fail(`${service} canonical Dockerfile must not depend on the hardened archive`);
+    }
+    const requiredPatterns = [
+      serviceContract.dockerfile,
+      ".dockerignore",
+      "package.json",
+      "pnpm-lock.yaml",
+      "pnpm-workspace.yaml",
+      "shared/**",
+      "server/**",
+      "drizzle/**",
+    ];
+    for (const pattern of requiredPatterns) {
+      if (!serviceContract.watchPatterns?.includes(pattern)) {
+        fail(`${service} canonical watchPatterns must include ${pattern}`);
+      }
+    }
   }
 }
 
-const expectedWatchPatterns = {
-  "lira-web": [
-    "client/**",
-    "shared/**",
-    "apps/web/**",
-    "Dockerfile.web",
-    ".dockerignore",
-    "package.json",
-    "pnpm-lock.yaml",
-    "pnpm-workspace.yaml",
-    "patches/**",
-    "tsconfig.json",
-    "vite.config.ts",
-    "components.json",
-  ],
-  ...Object.fromEntries(archiveServices.map((service) => {
+const expectedWebPatterns = [
+  "client/**",
+  "shared/**",
+  "apps/web/**",
+  "Dockerfile.web",
+  ".dockerignore",
+  "package.json",
+  "pnpm-lock.yaml",
+  "pnpm-workspace.yaml",
+  "patches/**",
+  "tsconfig.json",
+  "vite.config.ts",
+  "components.json",
+];
+if (JSON.stringify(webService?.watchPatterns) !== JSON.stringify(expectedWebPatterns)) {
+  fail("lira-web watchPatterns drifted from its complete build-input contract");
+}
+
+if (!canonicalCutover) {
+  for (const service of backendServices) {
     const serviceContract = contract.services?.[service] ?? {};
-    return [service, [serviceContract.dockerfile, ".dockerignore", serviceContract.artifactSource]];
-  })),
-};
-
-for (const [service, patterns] of Object.entries(expectedWatchPatterns)) {
-  const actual = contract.services?.[service]?.watchPatterns;
-  if (JSON.stringify(actual) !== JSON.stringify(patterns)) {
-    fail(`${service} watchPatterns drifted from its complete build-input contract`);
+    const expected = [serviceContract.dockerfile, ".dockerignore", serviceContract.artifactSource];
+    if (JSON.stringify(serviceContract.watchPatterns) !== JSON.stringify(expected)) {
+      fail(`${service} watchPatterns drifted from its archive-backed build-input contract`);
+    }
   }
 }
 
-if (!process.exitCode) console.log("Deployment contract validation passed.");
+if (!process.exitCode) console.log(`Deployment contract validation passed (backend mode: ${canonicalCutover ? "canonical" : "archive"}).`);
