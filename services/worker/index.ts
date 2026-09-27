@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { createServer } from "node:http";
-import { dispatchPendingSandboxOutbox } from "../../server/db";
+import { closeDb, dispatchPendingSandboxOutbox } from "../../server/db";
+import { errorClass, operationalLog } from "../../server/observability";
 
 function assertSandboxRuntime() {
   if (process.env.LIRA_REAL_MONEY_ENABLED === "true") {
@@ -22,21 +23,47 @@ assertSandboxRuntime();
 let stopping = false;
 let running = false;
 let lastSuccessAt: string | null = null;
-let lastError: string | null = null;
+let lastErrorAt: string | null = null;
+let consecutiveFailures = 0;
+const counters = {
+  cycles: 0,
+  dispatched: 0,
+  unknown: 0,
+  deadLettered: 0,
+  tickFailures: 0,
+};
 
 async function tick() {
   if (running || stopping) return;
   running = true;
+  counters.cycles += 1;
+  const startedAt = Date.now();
+
   try {
     const result = await dispatchPendingSandboxOutbox(batchSize);
     lastSuccessAt = new Date().toISOString();
-    lastError = null;
-    if (result.dispatched || result.unknown) {
-      console.log("[lira-worker] dispatch cycle", result);
-    }
+    consecutiveFailures = 0;
+    counters.dispatched += result.dispatched;
+    counters.unknown += result.unknown;
+    counters.deadLettered += result.deadLettered;
+
+    operationalLog("lira-worker", "dispatch_cycle_completed", {
+      durationMs: Date.now() - startedAt,
+      dispatched: result.dispatched,
+      unknown: result.unknown,
+      deadLettered: result.deadLettered,
+      cycles: counters.cycles,
+    }, result.deadLettered > 0 ? "warn" : "info");
   } catch (error) {
-    lastError = error instanceof Error ? error.message : String(error);
-    console.error("[lira-worker] dispatch cycle failed", error);
+    consecutiveFailures += 1;
+    counters.tickFailures += 1;
+    lastErrorAt = new Date().toISOString();
+    operationalLog("lira-worker", "dispatch_cycle_failed", {
+      durationMs: Date.now() - startedAt,
+      errorClass: errorClass(error),
+      consecutiveFailures,
+      tickFailures: counters.tickFailures,
+    }, "error");
   } finally {
     running = false;
   }
@@ -52,13 +79,29 @@ const healthServer = createServer((req, res) => {
     res.end("not found");
     return;
   }
+
+  const degraded = consecutiveFailures >= 3;
   res.setHeader("content-type", "application/json");
-  res.statusCode = lastError && !lastSuccessAt ? 503 : 200;
-  res.end(JSON.stringify({ service: "lira-worker", status: res.statusCode === 200 ? "ok" : "degraded", running, lastSuccessAt, lastError }));
+  res.statusCode = degraded ? 503 : 200;
+  res.end(JSON.stringify({
+    service: "lira-worker",
+    status: degraded ? "degraded" : "ok",
+    mode: "sandbox",
+    running,
+    lastSuccessAt,
+    lastErrorAt,
+    consecutiveFailures,
+    counters,
+  }));
+});
+
+healthServer.on("error", (error) => {
+  operationalLog("lira-worker", "health_server_error", { errorClass: errorClass(error) }, "error");
+  process.exitCode = 1;
 });
 
 healthServer.listen(healthPort, "0.0.0.0", () => {
-  console.log(`[lira-worker] health endpoint listening on ${healthPort}`);
+  operationalLog("lira-worker", "service_started", { port: healthPort, intervalMs, batchSize, mode: "sandbox" });
 });
 
 const timer = setInterval(() => void tick(), intervalMs);
@@ -69,12 +112,29 @@ function shutdown(signal: string) {
   if (stopping) return;
   stopping = true;
   clearInterval(timer);
-  console.log(`[lira-worker] received ${signal}; shutting down`);
-  healthServer.close((error) => {
-    if (error) {
-      console.error("[lira-worker] health server shutdown failed", error);
-      process.exitCode = 1;
-    }
+  operationalLog("lira-worker", "shutdown_started", { signal });
+
+  const forceExitTimer = setTimeout(() => {
+    operationalLog("lira-worker", "shutdown_timeout", { signal }, "error");
+    process.exitCode = 1;
+  }, 10_000);
+  forceExitTimer.unref();
+
+  healthServer.close((serverError) => {
+    void closeDb()
+      .catch((dbError) => {
+        operationalLog("lira-worker", "database_shutdown_failed", { errorClass: errorClass(dbError) }, "error");
+        process.exitCode = 1;
+      })
+      .finally(() => {
+        clearTimeout(forceExitTimer);
+        if (serverError) {
+          operationalLog("lira-worker", "health_server_shutdown_failed", { errorClass: errorClass(serverError) }, "error");
+          process.exitCode = 1;
+        } else {
+          operationalLog("lira-worker", "shutdown_completed", { signal });
+        }
+      });
   });
 }
 
