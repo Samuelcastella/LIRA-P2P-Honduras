@@ -253,7 +253,7 @@ export default function Home() {
         toast.success(result.replayed ? "Operación recuperada sin duplicar el envío" : "Transferencia registrada en el sandbox");
       } else {
         const result = await requestMutation.mutateAsync({ amountMinor, currency: "HNL", recipientHandle: selectedContact.handle, idempotencyKey });
-        setLatestReference(`REQ-${result.paymentRequest.id.slice(0, 8).toUpperCase()}`);
+        setLatestReference(`REQ-${result.request.id.slice(0, 8).toUpperCase()}`);
         setLatestStatus("Solicitado");
         toast.success(result.replayed ? "Solicitud recuperada sin duplicarla" : "Solicitud creada en el sandbox");
       }
