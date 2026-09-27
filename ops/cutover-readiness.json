@@ -35,15 +35,15 @@
   "gates": {
     "mainCiGreen": {
       "status": "verified",
-      "evidence": "GitHub Actions main run #88: sandbox source, canonical PostgreSQL, and hardened PostgreSQL jobs all passed."
+      "evidence": "GitHub Actions main run #97 passed sandbox source, canonical PostgreSQL, and hardened PostgreSQL jobs after operational-readiness merge."
     },
     "canonicalPostgres": {
       "status": "verified",
       "evidence": "Canonical migrations, checksum idempotency, fail-closed control, audit immutability, ledger immutability, balanced journals, tests, and builds run against PostgreSQL 16."
     },
     "productionPostgresMajorParity": {
-      "status": "pending",
-      "evidence": "Production Railway Postgres uses major version 18. CI parity for canonical source and hardened rollback baseline on PostgreSQL 18 is being added."
+      "status": "verified",
+      "evidence": "GitHub Actions run #98 passed canonical and hardened rollback paths on PostgreSQL 16 and PostgreSQL 18; production Railway Postgres is major version 18."
     },
     "workerReconciliationParity": {
       "status": "verified",
