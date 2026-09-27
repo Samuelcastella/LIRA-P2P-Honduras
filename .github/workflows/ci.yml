@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    env:
+      # CI never talks to a real database, cache or provider; these only
+      # satisfy code paths that read the flags/values at import time.
+      LIRA_SANDBOX_ONLY: "true"
+      LIRA_REAL_MONEY_ENABLED: "false"
+      DATABASE_URL: "postgresql://ci:ci@localhost:5432/ci"
+      REDIS_URL: "redis://localhost:6379"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify hardened source archive checksum
+        run: sha256sum -c lira-p2p-honduras-hardened-v2.sha256
+
+      - name: Extract hardened source archive
+        run: unzip -q lira-p2p-honduras-hardened-v2.zip -d source
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.4.1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: source/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: source
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Typecheck
+        working-directory: source
+        run: pnpm check
+
+      - name: Test
+        working-directory: source
+        run: pnpm test
+
+      - name: Build all services
+        working-directory: source
+        run: pnpm build:api && pnpm build:worker && pnpm build:reconciliation && pnpm build:web
