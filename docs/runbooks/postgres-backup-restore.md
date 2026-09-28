@@ -60,6 +60,19 @@ Railway documentation reference:
 The preferred proof is a restore into an isolated disposable environment,
 never over the active production database.
 
+For LIRA, the canonical read-only verification command is:
+
+```bash
+RESTORE_VALIDATION_DATABASE_URL="<restored database connection>" \
+  node scripts/verify-restored-postgres.mjs
+```
+
+The validator opens a read-only transaction, emits aggregate/schema evidence
+only, compares applied migration checksums with the repository migration files,
+and exits nonzero if required tables, migrations, triggers, HNL constraints, or
+journal balance invariants are not satisfied. Do not point this command at the
+active production database during a restore drill.
+
 1. Select the verified backup/recovery point.
 2. Restore it to an isolated environment or restored volume according to
    Railway's supported restore workflow.
