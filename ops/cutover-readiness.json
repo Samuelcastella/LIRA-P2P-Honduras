@@ -78,17 +78,17 @@
       "evidence": "Canonical services expose sanitized health state and structured operational events/counters for dispatch and reconciliation."
     },
     "backupRecoveryPoint": {
-      "status": "blocked",
-      "evidence": "A PostgreSQL volume exists, but an exact recent recoverable backup/PITR recovery point has not been independently verified through the available read-only tools."
+      "status": "verified",
+      "evidence": "Railway Pro plan enabled 2026-09-28; PostgreSQL continuous backup (pgbackrest) provisioned on the production database service. Deployment logs confirm: stanza-create completed, a full backup completed successfully (full backup size = 31.2MB, file total = 1374), pgbackrest-watcher reported a PITR anchor emitted, catalog verification confirmed the full backup present in remote S3-compatible storage, and continuous WAL archiving is healthy (10+ segments archived, failed=0, gap_state=clear). Verified via mcp__Railway__get-service-config (WAL_ARCHIVE_* variables and clusterRole: root present) and mcp__Railway__get-logs filtered for backup/pgbackrest/archive/WAL on the production Postgres service."
     },
     "restoreVerification": {
       "status": "blocked",
-      "evidence": "No disposable restore test has yet proven recovery from the production backup source."
+      "evidence": "No disposable restore test has yet proven recovery from the production backup source. backupRecoveryPoint confirms a valid, current recovery point exists; restoreVerification still requires provisioning a separate disposable Postgres service from that PITR point and validating recovered data before this gate can be marked verified."
     }
   },
   "cutover": {
     "status": "blocked",
-    "reason": "Do not switch backend Dockerfiles/artifact sources until backupRecoveryPoint and restoreVerification are verified.",
+    "reason": "backupRecoveryPoint is now verified with real pgbackrest evidence. Do not switch backend Dockerfiles/artifact sources until restoreVerification is also verified via an actual disposable restore drill.",
     "order": [
       "lira-api",
       "lira-worker",
