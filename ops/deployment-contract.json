@@ -71,6 +71,9 @@
       "lira-worker",
       "lira-reconciliation"
     ],
-    "note": "Repository contract prepared for API-first cutover. Worker and reconciliation remain archive-backed until their independent verification steps complete."
+    "note": "Repository contract prepared for API-first cutover. Worker and reconciliation remain archive-backed until their independent verification steps complete.",
+    "status": "prepared-not-applied",
+    "pendingService": "lira-api",
+    "blocker": "Railway Wait for CI is disabled on all backend services; no production Dockerfile path has been switched."
   }
 }
