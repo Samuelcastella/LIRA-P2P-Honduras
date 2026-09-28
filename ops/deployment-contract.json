@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "principles": {
     "sandboxOnly": true,
     "realMoneyEnabled": false,
@@ -25,12 +25,22 @@
       ]
     },
     "lira-api": {
-      "dockerfile": "Dockerfile.api",
-      "artifactSource": "lira-p2p-honduras-hardened-v2.zip",
+      "dockerfile": "ops/docker/canonical/Dockerfile.api",
+      "artifactSource": "canonical-repository",
       "watchPatterns": [
-        "Dockerfile.api",
+        "ops/docker/canonical/Dockerfile.api",
         ".dockerignore",
-        "lira-p2p-honduras-hardened-v2.zip"
+        "package.json",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+        "patches/**",
+        "tsconfig.json",
+        "services/api/**",
+        "server/**",
+        "shared/**",
+        "drizzle/**",
+        "db/**",
+        "scripts/**"
       ]
     },
     "lira-worker": {
@@ -51,5 +61,16 @@
         "lira-p2p-honduras-hardened-v2.zip"
       ]
     }
+  },
+  "cutoverState": {
+    "mode": "progressive-canonical",
+    "canonicalServices": [
+      "lira-api"
+    ],
+    "archiveServices": [
+      "lira-worker",
+      "lira-reconciliation"
+    ],
+    "note": "Repository contract prepared for API-first cutover. Worker and reconciliation remain archive-backed until their independent verification steps complete."
   }
 }
