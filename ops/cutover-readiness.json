@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "targetEnvironment": "production",
   "mode": "sandbox",
   "realMoneyEnabled": false,
@@ -109,13 +109,13 @@
       "evidence": "Railway Pro plan enabled 2026-09-28; PostgreSQL continuous backup (pgbackrest) provisioned on the production database service. Deployment logs confirm: stanza-create completed, a full backup completed successfully (full backup size = 31.2MB, file total = 1374), pgbackrest-watcher reported a PITR anchor emitted, catalog verification confirmed the full backup present in remote S3-compatible storage, and continuous WAL archiving is healthy (10+ segments archived, failed=0, gap_state=clear). Verified via mcp__Railway__get-service-config (WAL_ARCHIVE_* variables and clusterRole: root present) and mcp__Railway__get-logs filtered for backup/pgbackrest/archive/WAL on the production Postgres service."
     },
     "restoreVerification": {
-      "status": "blocked",
-      "evidence": "No disposable restore test has yet proven recovery from the production backup source. backupRecoveryPoint confirms a valid, current recovery point exists; restoreVerification still requires provisioning a separate disposable Postgres service from that PITR point and validating recovered data before this gate can be marked verified."
+      "status": "verified",
+      "evidence": "Disposable PITR restore Postgres-restored-20260928-0924 completed recovery to transaction 777 at 2026-09-28 09:24:42.116473+00. Read-only validator restore-validator-20260928-v2 deployment c130f30d-1f48-4b19-825f-8c962d5b656a completed SUCCESS on Git commit 2e66c8af41ee2cc4a3726da571ffb4a1f975baba with VALIDATION_SUCCESS: PostgreSQL 18.6, pg_is_in_recovery=false, 3 required migrations present with zero checksum mismatches, all required tables/triggers present, transfers_enabled=false, zero unbalanced journals, zero non-HNL transfers, and zero non-HNL ledger rows. See docs/bank-readiness/evidence/restore-drill-2026-09-28.md."
     }
   },
   "cutover": {
-    "status": "blocked",
-    "reason": "backupRecoveryPoint and candidateImageSmoke are now verified. Do not switch backend Dockerfile paths/artifact sources until restoreVerification is also verified via an actual disposable restore drill.",
+    "status": "ready",
+    "reason": "All mandatory sandbox cutover readiness gates are verified. canonicalBackendMigrationReady remains false until the explicit canonical backend activation change; no Railway backend Dockerfile path has been switched by this evidence update.",
     "order": [
       "lira-api",
       "lira-worker",
