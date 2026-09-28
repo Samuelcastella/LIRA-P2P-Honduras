@@ -1,5 +1,5 @@
 {
-  "version": 4,
+  "version": 5,
   "targetEnvironment": "production",
   "mode": "sandbox",
   "realMoneyEnabled": false,
@@ -54,7 +54,7 @@
   "gates": {
     "mainCiGreen": {
       "status": "verified",
-      "evidence": "GitHub Actions main run #97 passed sandbox source, canonical PostgreSQL, and hardened PostgreSQL jobs after operational-readiness merge."
+      "evidence": "GitHub Actions main run #119 passed all five sandbox/canonical/hardened validation jobs on commit 65139361a761ebf1f57f30bcd995df1f0a4f2f68 after canonicalBackendMigrationReady approval."
     },
     "canonicalPostgres": {
       "status": "verified",
@@ -121,5 +121,11 @@
       "lira-worker",
       "lira-reconciliation"
     ]
+  },
+  "preCutover": {
+    "status": "final-verification",
+    "preparedAt": "2026-09-28",
+    "reviewedMainCommit": "65139361a761ebf1f57f30bcd995df1f0a4f2f68",
+    "note": "This evidence refresh intentionally triggers the LIRA Cutover Readiness workflow so the exact post-approval candidate images are rebuilt and smoke-tested before Railway service switching."
   }
 }
