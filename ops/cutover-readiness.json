@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "targetEnvironment": "production",
   "mode": "sandbox",
   "realMoneyEnabled": false,
@@ -30,6 +30,25 @@
       "engine": "postgresql",
       "volumeId": "a08417d9-badf-4a46-bb2b-f42a1e88cc73",
       "postgresMajor": 18
+    }
+  },
+  "canonicalCandidate": {
+    "strategy": "railway-dockerfile-path-switch",
+    "rollbackStrategy": "restore-archive-dockerfile-path-and-watch-patterns",
+    "services": {
+      "lira-api": {
+        "dockerfile": "ops/docker/canonical/Dockerfile.api",
+        "healthcheckPath": "/ready",
+        "preDeployCommand": "node scripts/migrate.mjs"
+      },
+      "lira-worker": {
+        "dockerfile": "ops/docker/canonical/Dockerfile.worker",
+        "healthcheckPath": "/health"
+      },
+      "lira-reconciliation": {
+        "dockerfile": "ops/docker/canonical/Dockerfile.reconciliation",
+        "healthcheckPath": "/health"
+      }
     }
   },
   "gates": {
@@ -77,6 +96,14 @@
       "status": "verified",
       "evidence": "Canonical services expose sanitized health state and structured operational events/counters for dispatch and reconciliation."
     },
+    "deploymentCiGate": {
+      "status": "verified",
+      "evidence": "Railway Wait for CI/check-suite gating was enabled for lira-api, lira-worker, and lira-reconciliation on 2026-09-27 without triggering a deployment."
+    },
+    "candidateImageSmoke": {
+      "status": "validating",
+      "evidence": "Awaiting green LIRA Cutover Readiness workflow on the exact candidate commit; the workflow builds all three canonical images, runs API migrations twice on PostgreSQL 18, checks production health paths, and revalidates the hardened rollback artifact."
+    },
     "backupRecoveryPoint": {
       "status": "verified",
       "evidence": "Railway Pro plan enabled 2026-09-28; PostgreSQL continuous backup (pgbackrest) provisioned on the production database service. Deployment logs confirm: stanza-create completed, a full backup completed successfully (full backup size = 31.2MB, file total = 1374), pgbackrest-watcher reported a PITR anchor emitted, catalog verification confirmed the full backup present in remote S3-compatible storage, and continuous WAL archiving is healthy (10+ segments archived, failed=0, gap_state=clear). Verified via mcp__Railway__get-service-config (WAL_ARCHIVE_* variables and clusterRole: root present) and mcp__Railway__get-logs filtered for backup/pgbackrest/archive/WAL on the production Postgres service."
@@ -88,7 +115,7 @@
   },
   "cutover": {
     "status": "blocked",
-    "reason": "backupRecoveryPoint is now verified with real pgbackrest evidence. Do not switch backend Dockerfiles/artifact sources until restoreVerification is also verified via an actual disposable restore drill.",
+    "reason": "backupRecoveryPoint is now verified with real pgbackrest evidence. Do not switch backend Dockerfile paths/artifact sources until candidateImageSmoke and restoreVerification are also verified.",
     "order": [
       "lira-api",
       "lira-worker",
