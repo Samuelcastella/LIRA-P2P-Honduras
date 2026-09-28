@@ -1,5 +1,6 @@
 import { and, desc, eq, inArray, lt, ne, or, sql } from "drizzle-orm";
-import { drizzle } from "drizzle-orm/mysql2";
+import { Pool } from "pg";
+import { drizzle } from "drizzle-orm/node-postgres";
 import {
   auditEvents,
   bankAccounts,
@@ -58,18 +59,35 @@ const SANDBOX_CLEARING_ACCOUNT_ID = "sandbox-clearing-hnl";
 const SANDBOX_SYSTEM_OPEN_ID = "system-sandbox-ledger";
 const SANDBOX_SEED_AMOUNT_MINOR = 325_000;
 
+let _pool: Pool | null = null;
 let _db: ReturnType<typeof drizzle> | null = null;
 
 export async function getDb() {
-  if (!_db && process.env.DATABASE_URL) {
+  if (!_db && ENV.databaseUrl) {
     try {
-      _db = drizzle(process.env.DATABASE_URL);
+      _pool = new Pool({
+        connectionString: ENV.databaseUrl,
+        max: Number(process.env.PG_POOL_MAX ?? 10),
+        idleTimeoutMillis: 30_000,
+        connectionTimeoutMillis: 5_000,
+        application_name: "lira-financial-core",
+      });
+      _pool.on("error", (error) => console.error("[Database] PostgreSQL pool error", error));
+      _db = drizzle(_pool);
     } catch (error) {
       console.warn("[Database] Failed to connect:", error);
+      _pool = null;
       _db = null;
     }
   }
   return _db;
+}
+
+export async function closeDb() {
+  const pool = _pool;
+  _pool = null;
+  _db = null;
+  if (pool) await pool.end();
 }
 
 function requiredDb(db: ReturnType<typeof drizzle> | null) {
@@ -100,7 +118,7 @@ export async function upsertUser(user: InsertUser): Promise<void> {
   values.role = user.role ?? (user.openId === ENV.ownerOpenId ? "admin" : "user");
   updateSet.role = values.role;
 
-  await db.insert(users).values(values).onDuplicateKeyUpdate({ set: updateSet });
+  await db.insert(users).values(values).onConflictDoUpdate({ target: users.openId, set: updateSet as any });
 }
 
 export async function getUserByOpenId(openId: string) {
@@ -118,7 +136,7 @@ async function ensureSandboxSystemUser(db: ReturnType<typeof drizzle>) {
     loginMethod: "system",
     role: "admin",
     lastSignedIn: new Date(),
-  }).onDuplicateKeyUpdate({ set: { name: "LIRA Sandbox Ledger", lastSignedIn: new Date() } });
+  }).onConflictDoUpdate({ target: users.openId, set: { name: "LIRA Sandbox Ledger", lastSignedIn: new Date(), updatedAt: new Date() } });
 
   const [systemUser] = await db.select().from(users).where(eq(users.openId, SANDBOX_SYSTEM_OPEN_ID)).limit(1);
   if (!systemUser) throw new Error("Unable to initialize sandbox system user");
@@ -177,7 +195,8 @@ async function upsertReconciliation(tx: any, params: {
     reportedAmountMinor: params.reportedAmountMinor ?? null,
     status: params.status,
     updatedAt: now,
-  }).onDuplicateKeyUpdate({
+  }).onConflictDoUpdate({
+    target: reconciliationItems.transferId,
     set: {
       provider: SANDBOX_PROVIDER,
       providerReference: params.providerReference,
@@ -506,9 +525,9 @@ export async function setUserPin(userId: number, context: SecurityClientContext,
       await tx.update(userSecurityProfiles).set({ pinHash: nextHash, failedPinAttempts: 0, lockedUntil: null, pinUpdatedAt: new Date() }).where(eq(userSecurityProfiles.userId, userId));
     }
     const revoked = isRotation
-      ? await tx.update(securitySessions).set({ revokedAt: new Date() }).where(and(eq(securitySessions.userId, userId), ne(securitySessions.id, current.sessionId), sql`${securitySessions.revokedAt} is null`))
+      ? await tx.update(securitySessions).set({ revokedAt: new Date(), updatedAt: new Date() }).where(and(eq(securitySessions.userId, userId), ne(securitySessions.id, current.sessionId), sql`${securitySessions.revokedAt} is null`)).returning({ id: securitySessions.id })
       : null;
-    await writeAudit(tx, { actorUserId: userId, actorType: "user", action: isRotation ? "security_pin_rotated" : "security_pin_set", resource: "security_profile", resourceId: String(userId), requestId: crypto.randomUUID(), metadata: { method: "scrypt", revokedOtherSessions: Number(revoked?.[0].affectedRows ?? 0), sandbox: true } });
+    await writeAudit(tx, { actorUserId: userId, actorType: "user", action: isRotation ? "security_pin_rotated" : "security_pin_set", resource: "security_profile", resourceId: String(userId), requestId: crypto.randomUUID(), metadata: { method: "scrypt", revokedOtherSessions: revoked?.length ?? 0, sandbox: true } });
     return { ok: true as const };
   });
   if (!outcome.ok) throw new Error(outcome.message);
@@ -587,8 +606,8 @@ async function consumeVerifiedTransferChallenge(tx: any, userId: number, session
     eq(otpChallenges.purpose, "transfer"),
     eq(otpChallenges.status, "verified"),
     sql`${otpChallenges.expiresAt} > ${now}`,
-  ));
-  if (Number(result[0].affectedRows ?? 0) !== 1) throw new Error("La verificación de la transferencia no es válida");
+  )).returning({ id: otpChallenges.id });
+  if (result.length !== 1) throw new Error("La verificación de la transferencia no es válida");
   await writeAudit(tx, { actorUserId: userId, actorType: "system", action: "transfer_otp_consumed", resource: "otp_challenge", resourceId: challengeId, requestId: challengeId, metadata: { sessionId: session.id } });
 }
 
@@ -607,16 +626,16 @@ async function reserveSandboxDailyTransferLimit(tx: any, userId: number, amountM
     }).where(and(
       eq(dailyTransferControls.id, current.id),
       sql`${dailyTransferControls.attemptedMinor} + ${amountMinor} <= ${SANDBOX_SECURITY_POLICY.maxDailyOutgoingMinor}`,
-    ));
-    if (Number(result[0].affectedRows ?? 0) !== 1) throw new Error("El monto supera el límite diario del sandbox");
+    )).returning({ id: dailyTransferControls.id });
+    if (result.length !== 1) throw new Error("El monto supera el límite diario del sandbox");
   }
   await writeAudit(tx, { actorUserId: userId, actorType: "system", action: "sandbox_daily_limit_reserved", resource: "daily_transfer_control", resourceId: `${userId}:${periodStart.toISOString().slice(0, 10)}`, requestId, metadata: { amountMinor, period: "utc_day", sandbox: true } });
 }
 
 export async function revokeSecuritySession(userId: number, sessionId: string) {
   const db = requiredDb(await getDb());
-  const result = await db.update(securitySessions).set({ revokedAt: new Date() }).where(and(eq(securitySessions.id, sessionId), eq(securitySessions.userId, userId), sql`${securitySessions.revokedAt} is null`));
-  if (Number(result[0].affectedRows ?? 0) !== 1) throw new Error("La sesión no está activa o no pertenece al usuario");
+  const result = await db.update(securitySessions).set({ revokedAt: new Date(), updatedAt: new Date() }).where(and(eq(securitySessions.id, sessionId), eq(securitySessions.userId, userId), sql`${securitySessions.revokedAt} is null`)).returning({ id: securitySessions.id });
+  if (result.length !== 1) throw new Error("La sesión no está activa o no pertenece al usuario");
   await writeAudit(db, { actorUserId: userId, actorType: "user", action: "security_session_revoked", resource: "security_session", resourceId: sessionId, requestId: sessionId, metadata: {} });
   return { success: true } as const;
 }
@@ -625,12 +644,12 @@ export async function revokeOtherSecuritySessions(userId: number, context: Secur
   const db = requiredDb(await getDb());
   return db.transaction(async (tx) => {
     const current = await ensureSecurityContext(tx, userId, context);
-    const result = await tx.update(securitySessions).set({ revokedAt: new Date() }).where(and(
+    const result = await tx.update(securitySessions).set({ revokedAt: new Date(), updatedAt: new Date() }).where(and(
       eq(securitySessions.userId, userId),
       ne(securitySessions.id, current.sessionId),
       sql`${securitySessions.revokedAt} is null`,
-    ));
-    const revoked = Number(result[0].affectedRows ?? 0);
+    )).returning({ id: securitySessions.id });
+    const revoked = result.length;
     await writeAudit(tx, { actorUserId: userId, actorType: "user", action: "security_other_sessions_revoked", resource: "security_session", resourceId: current.sessionId, requestId: crypto.randomUUID(), metadata: { revoked, sandbox: true } });
     return { success: true, revoked } as const;
   });
@@ -639,8 +658,8 @@ export async function revokeOtherSecuritySessions(userId: number, context: Secur
 export async function revokeTrustedDevice(userId: number, deviceId: string) {
   const db = requiredDb(await getDb());
   await db.transaction(async (tx) => {
-    const result = await tx.update(trustedDevices).set({ status: "revoked", revokedAt: new Date(), updatedAt: new Date() }).where(and(eq(trustedDevices.id, deviceId), eq(trustedDevices.userId, userId), sql`${trustedDevices.revokedAt} is null`));
-    if (Number(result[0].affectedRows ?? 0) !== 1) throw new Error("El dispositivo no está activo o no pertenece al usuario");
+    const result = await tx.update(trustedDevices).set({ status: "revoked", revokedAt: new Date(), updatedAt: new Date() }).where(and(eq(trustedDevices.id, deviceId), eq(trustedDevices.userId, userId), sql`${trustedDevices.revokedAt} is null`)).returning({ id: trustedDevices.id });
+    if (result.length !== 1) throw new Error("El dispositivo no está activo o no pertenece al usuario");
     await tx.update(securitySessions).set({ revokedAt: new Date() }).where(and(eq(securitySessions.deviceId, deviceId), eq(securitySessions.userId, userId), sql`${securitySessions.revokedAt} is null`));
     await writeAudit(tx, { actorUserId: userId, actorType: "user", action: "trusted_device_revoked", resource: "trusted_device", resourceId: deviceId, requestId: deviceId, metadata: {} });
   });
@@ -661,7 +680,7 @@ export async function ensureSandboxWorkspace(userId: number) {
       accountType: "sandbox_clearing",
       currency: "HNL",
       status: "active",
-    }).onDuplicateKeyUpdate({ set: { status: "active", updatedAt: new Date() } });
+    }).onConflictDoUpdate({ target: financialAccounts.id, set: { status: "active", updatedAt: new Date() } });
 
     await tx.insert(bankAccounts).values({
       id: bankAccountId,
@@ -672,7 +691,7 @@ export async function ensureSandboxWorkspace(userId: number) {
       lastFour: "8421",
       status: "linked",
       tokenReference: `sandbox-reference-${userId}`,
-    }).onDuplicateKeyUpdate({ set: { status: "linked", displayName: "Banco Uno Sandbox" } });
+    }).onConflictDoUpdate({ target: bankAccounts.id, set: { status: "linked", displayName: "Banco Uno Sandbox", updatedAt: new Date() } });
 
     await tx.insert(financialAccounts).values({
       id: walletId,
@@ -681,7 +700,7 @@ export async function ensureSandboxWorkspace(userId: number) {
       accountType: "user_wallet",
       currency: "HNL",
       status: "active",
-    }).onDuplicateKeyUpdate({ set: { status: "active", bankAccountId, updatedAt: new Date() } });
+    }).onConflictDoUpdate({ target: financialAccounts.id, set: { status: "active", bankAccountId, updatedAt: new Date() } });
 
     const seedKey = `sandbox-seed-v1-${userId}`;
     const [existingSeed] = await tx.select().from(transfers).where(and(
@@ -774,7 +793,7 @@ export async function getFinancialDashboard(userId: number) {
     accounts,
     recentTransfers,
     recentRisk,
-    transfersEnabled: controls[0]?.enabled !== 0,
+    transfersEnabled: controls[0]?.enabled !== false,
   };
 }
 
@@ -789,7 +808,7 @@ async function resolveCounterpartyAccount(db: ReturnType<typeof drizzle>, handle
     accountType: "user_wallet",
     currency: "HNL",
     status: "active",
-  }).onDuplicateKeyUpdate({ set: { status: "active", updatedAt: new Date() } });
+  }).onConflictDoUpdate({ target: financialAccounts.id, set: { status: "active", updatedAt: new Date() } });
   return id;
 }
 
@@ -808,7 +827,7 @@ export async function createSandboxTransfer(userId: number, input: Omit<Transfer
 
   return db.transaction(async (tx) => {
     const [control] = await tx.select().from(operationalControls).where(eq(operationalControls.control, "transfers_enabled")).limit(1);
-    if (control?.enabled === 0) throw new Error("Transfers are temporarily paused by an operational control");
+    if (control?.enabled === false) throw new Error("Transfers are temporarily paused by an operational control");
 
     const [prior] = await tx.select().from(transfers).where(and(
       eq(transfers.senderUserId, userId),
@@ -824,7 +843,7 @@ export async function createSandboxTransfer(userId: number, input: Omit<Transfer
     await consumeVerifiedTransferChallenge(tx, userId, sessionFingerprint, verificationChallengeId);
 
     const recent = await tx.select({ count: sql<number>`count(*)` }).from(transfers)
-      .where(and(eq(transfers.senderUserId, userId), sql`${transfers.createdAt} > date_sub(now(), interval 5 minute)`));
+      .where(and(eq(transfers.senderUserId, userId), sql`${transfers.createdAt} > now() - interval '5 minutes'`));
     const risk = evaluateRisk({ amountMinor: intent.amountMinor, attemptsInFiveMinutes: Number(recent[0]?.count ?? 0) });
     const transferId = crypto.randomUUID();
     const reference = createTransferReference();
@@ -935,30 +954,64 @@ export async function createSandboxTransfer(userId: number, input: Omit<Transfer
   });
 }
 
+const MAX_DISPATCH_ATTEMPTS = Number(process.env.LIRA_OUTBOX_MAX_ATTEMPTS ?? 5);
+const DISPATCH_RETRY_BACKOFF_MS = Number(process.env.LIRA_OUTBOX_RETRY_BACKOFF_MS ?? 30_000);
+
+if (!Number.isInteger(MAX_DISPATCH_ATTEMPTS) || MAX_DISPATCH_ATTEMPTS < 1 || MAX_DISPATCH_ATTEMPTS > 100) {
+  throw new Error("LIRA_OUTBOX_MAX_ATTEMPTS must be an integer between 1 and 100");
+}
+if (!Number.isInteger(DISPATCH_RETRY_BACKOFF_MS) || DISPATCH_RETRY_BACKOFF_MS < 0 || DISPATCH_RETRY_BACKOFF_MS > 86_400_000) {
+  throw new Error("LIRA_OUTBOX_RETRY_BACKOFF_MS must be an integer between 0 and 86400000");
+}
+
 export async function dispatchPendingSandboxOutbox(limit = 20) {
   const db = requiredDb(await getDb());
   const adapter = new SandboxBankAdapter();
+  const retryCutoff = new Date(Date.now() - DISPATCH_RETRY_BACKOFF_MS);
   const pending = await db.select().from(outboxEvents)
-    .where(and(eq(outboxEvents.status, "pending"), eq(outboxEvents.eventType, "provider.transfer.requested")))
+    .where(and(
+      eq(outboxEvents.eventType, "provider.transfer.requested"),
+      or(
+        eq(outboxEvents.status, "pending"),
+        and(
+          eq(outboxEvents.status, "unknown"),
+          lt(outboxEvents.updatedAt, retryCutoff),
+          lt(outboxEvents.attemptCount, MAX_DISPATCH_ATTEMPTS),
+        ),
+      ),
+    ))
     .orderBy(outboxEvents.createdAt)
     .limit(limit);
 
   let dispatched = 0;
   let unknown = 0;
+  let deadLettered = 0;
 
-  for (const event of pending) {
+  for (const candidateEvent of pending) {
     const claimed = await db.transaction(async (tx) => {
-      const claim = await tx.update(outboxEvents).set({
+      const [event] = await tx.update(outboxEvents).set({
         status: "dispatching",
         claimedAt: new Date(),
         attemptCount: sql`${outboxEvents.attemptCount} + 1`,
         failureCode: null,
         updatedAt: new Date(),
-      }).where(and(eq(outboxEvents.id, event.id), eq(outboxEvents.status, "pending")));
-      if (Number(claim[0].affectedRows ?? 0) !== 1) return null;
+      }).where(and(
+        eq(outboxEvents.id, candidateEvent.id),
+        eq(outboxEvents.eventType, "provider.transfer.requested"),
+        or(
+          eq(outboxEvents.status, "pending"),
+          and(
+            eq(outboxEvents.status, "unknown"),
+            lt(outboxEvents.updatedAt, retryCutoff),
+            lt(outboxEvents.attemptCount, MAX_DISPATCH_ATTEMPTS),
+          ),
+        ),
+      )).returning();
 
-      const [candidate] = await tx.select().from(transfers).where(eq(transfers.id, event.aggregateId)).limit(1);
-      if (!candidate || candidate.status !== "processing") {
+      if (!event) return null;
+
+      const [candidateTransfer] = await tx.select().from(transfers).where(eq(transfers.id, event.aggregateId)).limit(1);
+      if (!candidateTransfer || (candidateTransfer.status !== "processing" && candidateTransfer.status !== "unknown")) {
         await tx.update(outboxEvents).set({
           status: "failed",
           failureCode: "transfer_not_dispatchable",
@@ -966,22 +1019,29 @@ export async function dispatchPendingSandboxOutbox(limit = 20) {
         }).where(eq(outboxEvents.id, event.id));
         return null;
       }
-      const transfer = await lockTransfer(tx, candidate.id);
-      await tx.update(transfers).set({ providerSubmittedAt: new Date(), updatedAt: new Date() }).where(eq(transfers.id, transfer.id));
-      return transfer;
+
+      const transfer = await lockTransfer(tx, candidateTransfer.id);
+      await tx.update(transfers).set({
+        providerSubmittedAt: new Date(),
+        updatedAt: new Date(),
+      }).where(eq(transfers.id, transfer.id));
+
+      return { event, transfer };
     });
+
     if (!claimed) continue;
+    const { event, transfer } = claimed;
 
     try {
       const providerResult = await adapter.createTransfer({
-        transferReference: claimed.reference,
-        amountMinor: claimed.amountMinor,
+        transferReference: transfer.reference,
+        amountMinor: transfer.amountMinor,
         currency: "HNL",
-        idempotencyKey: claimed.idempotencyKey,
+        idempotencyKey: transfer.idempotencyKey,
       });
 
       await db.transaction(async (tx) => {
-        const current = await lockTransfer(tx, claimed.id);
+        const current = await lockTransfer(tx, transfer.id);
         if (current.status !== "processing" && current.status !== "unknown") {
           await tx.update(outboxEvents).set({
             status: "failed",
@@ -1014,27 +1074,45 @@ export async function dispatchPendingSandboxOutbox(limit = 20) {
           resource: "transfer",
           resourceId: current.id,
           requestId: event.id,
-          metadata: { provider: adapter.name, providerReference: providerResult.providerReference },
+          metadata: {
+            provider: adapter.name,
+            providerReference: providerResult.providerReference,
+            attempt: event.attemptCount,
+          },
         });
       });
       dispatched += 1;
     } catch (error) {
+      const exhausted = event.attemptCount >= MAX_DISPATCH_ATTEMPTS;
+      let terminalized = false;
+
       await db.transaction(async (tx) => {
-        const current = await lockTransfer(tx, claimed.id);
+        const current = await lockTransfer(tx, transfer.id);
+        if (current.status !== "processing" && current.status !== "unknown") {
+          await tx.update(outboxEvents).set({
+            status: "failed",
+            failureCode: "transfer_not_dispatchable_after_provider_error",
+            updatedAt: new Date(),
+          }).where(eq(outboxEvents.id, event.id));
+          return;
+        }
+
         if (current.status === "processing") {
           assertAllowedTransition("processing", "unknown");
           await tx.update(transfers).set({
             status: "unknown",
-            unknownAt: new Date(),
+            unknownAt: current.unknownAt ?? new Date(),
             unknownReason: "provider_submission_outcome_unknown",
             updatedAt: new Date(),
           }).where(eq(transfers.id, current.id));
         }
+
         await tx.update(outboxEvents).set({
-          status: "unknown",
-          failureCode: "provider_submission_outcome_unknown",
+          status: exhausted ? "dead_letter" : "unknown",
+          failureCode: exhausted ? "provider_submission_dead_letter" : "provider_submission_outcome_unknown",
           updatedAt: new Date(),
         }).where(eq(outboxEvents.id, event.id));
+
         await upsertReconciliation(tx, {
           transferId: current.id,
           providerReference: current.providerReference ?? `UNRESOLVED-${current.reference}`,
@@ -1042,22 +1120,57 @@ export async function dispatchPendingSandboxOutbox(limit = 20) {
           reportedAmountMinor: null,
           status: "unknown",
         });
-        await writeAudit(tx, {
-          actorUserId: null,
-          actorType: "system",
-          action: "provider_dispatch_unknown",
-          resource: "transfer",
-          resourceId: current.id,
-          requestId: event.id,
-          metadata: { provider: adapter.name, errorClass: error instanceof Error ? error.name : "unknown" },
-        });
+
+        if (exhausted) {
+          await tx.insert(riskEvents).values({
+            id: crypto.randomUUID(),
+            userId: current.senderUserId,
+            transferId: current.id,
+            rule: "outbox_dispatch_dead_letter",
+            score: 90,
+            severity: "high",
+            decision: "review",
+            policyVersion: "sandbox-v2",
+          });
+          await writeAudit(tx, {
+            actorUserId: null,
+            actorType: "system",
+            action: "provider_dispatch_dead_lettered",
+            resource: "transfer",
+            resourceId: current.id,
+            requestId: event.id,
+            metadata: {
+              provider: adapter.name,
+              attempts: event.attemptCount,
+              errorClass: error instanceof Error ? error.name : "unknown",
+            },
+          });
+          terminalized = true;
+        } else {
+          await writeAudit(tx, {
+            actorUserId: null,
+            actorType: "system",
+            action: "provider_dispatch_unknown",
+            resource: "transfer",
+            resourceId: current.id,
+            requestId: event.id,
+            metadata: {
+              provider: adapter.name,
+              attempt: event.attemptCount,
+              errorClass: error instanceof Error ? error.name : "unknown",
+            },
+          });
+        }
       });
-      unknown += 1;
+
+      if (terminalized) deadLettered += 1;
+      else if (!exhausted) unknown += 1;
     }
   }
 
-  return { dispatched, unknown };
+  return { dispatched, unknown, deadLettered };
 }
+
 
 export async function processVerifiedProviderWebhook(webhook: ProviderWebhook, payloadHash: string) {
   const db = requiredDb(await getDb());
@@ -1195,6 +1308,51 @@ export async function processVerifiedProviderWebhook(webhook: ProviderWebhook, p
   });
 }
 
+const RECONCILIATION_STALE_MS = Number(process.env.LIRA_RECONCILIATION_STALE_MS ?? 15 * 60_000);
+const RECONCILIATION_STALE_ESCALATION_RULE = "reconciliation_stale_unresolved";
+
+if (!Number.isInteger(RECONCILIATION_STALE_MS) || RECONCILIATION_STALE_MS < 0 || RECONCILIATION_STALE_MS > 7 * 24 * 60 * 60_000) {
+  throw new Error("LIRA_RECONCILIATION_STALE_MS must be an integer between 0 and 604800000");
+}
+
+async function maybeEscalateStaleReconciliation(tx: any, transfer: any, providerStatus: string) {
+  const stuckSince = transfer.unknownAt ?? transfer.providerSubmittedAt ?? transfer.createdAt;
+  if (!(stuckSince instanceof Date)) return false;
+
+  const stuckForMs = Date.now() - stuckSince.getTime();
+  if (stuckForMs <= RECONCILIATION_STALE_MS) return false;
+
+  const [alreadyEscalated] = await tx.select({ id: riskEvents.id }).from(riskEvents)
+    .where(and(
+      eq(riskEvents.transferId, transfer.id),
+      eq(riskEvents.rule, RECONCILIATION_STALE_ESCALATION_RULE),
+    ))
+    .limit(1);
+
+  if (alreadyEscalated) return false;
+
+  await tx.insert(riskEvents).values({
+    id: crypto.randomUUID(),
+    userId: transfer.senderUserId,
+    transferId: transfer.id,
+    rule: RECONCILIATION_STALE_ESCALATION_RULE,
+    score: 85,
+    severity: "high",
+    decision: "review",
+    policyVersion: "sandbox-v2",
+  });
+  await writeAudit(tx, {
+    actorUserId: null,
+    actorType: "system",
+    action: "reconciliation_escalated",
+    resource: "transfer",
+    resourceId: transfer.id,
+    requestId: crypto.randomUUID(),
+    metadata: { stuckForMs, providerStatus },
+  });
+  return true;
+}
+
 export async function reconcilePendingSandboxTransfers(limit = 50) {
   const db = requiredDb(await getDb());
   const adapter = new SandboxBankAdapter();
@@ -1205,6 +1363,7 @@ export async function reconcilePendingSandboxTransfers(limit = 50) {
 
   let checked = 0;
   let resolved = 0;
+  let escalated = 0;
 
   for (const candidate of candidates) {
     let provider;
@@ -1227,6 +1386,9 @@ export async function reconcilePendingSandboxTransfers(limit = 50) {
           reportedAmountMinor: null,
           status: "unknown",
         });
+        if (await maybeEscalateStaleReconciliation(tx, transfer, "unavailable")) {
+          escalated += 1;
+        }
         await writeAudit(tx, {
           actorUserId: null,
           actorType: "system",
@@ -1282,6 +1444,9 @@ export async function reconcilePendingSandboxTransfers(limit = 50) {
           reportedAmountMinor: provider.amountMinor ?? null,
           status: "unknown",
         });
+        if (await maybeEscalateStaleReconciliation(tx, transfer, provider.status)) {
+          escalated += 1;
+        }
       }
 
       await writeAudit(tx, {
@@ -1296,8 +1461,9 @@ export async function reconcilePendingSandboxTransfers(limit = 50) {
     });
   }
 
-  return { checked, resolved };
+  return { checked, resolved, escalated };
 }
+
 
 export async function createPaymentRequest(userId: number, input: {
   amountMinor: number;
@@ -1321,7 +1487,7 @@ export async function createPaymentRequest(userId: number, input: {
       .where(and(eq(paymentRequests.requesterUserId, userId), eq(paymentRequests.idempotencyKey, input.idempotencyKey))).limit(1);
     if (prior[0]) {
       assertIdempotency(prior[0].requestFingerprint, requestFingerprint);
-      return { paymentRequest: prior[0], replayed: true };
+      return { request: prior[0], replayed: true };
     }
 
     const id = crypto.randomUUID();
@@ -1349,7 +1515,7 @@ export async function createPaymentRequest(userId: number, input: {
     });
     const [paymentRequest] = await tx.select().from(paymentRequests).where(eq(paymentRequests.id, id)).limit(1);
     if (!paymentRequest) throw new Error("Payment request was not persisted");
-    return { paymentRequest, replayed: false };
+    return { request: paymentRequest, replayed: false };
   });
 }
 
@@ -1372,16 +1538,17 @@ export async function cancelPaymentRequest(userId: number, paymentRequestId: str
 
 export async function expireOpenPaymentRequests() {
   const db = requiredDb(await getDb());
-  const result = await db.update(paymentRequests).set({ status: "expired" })
-    .where(and(eq(paymentRequests.status, "open"), lt(paymentRequests.expiresAt, new Date())));
-  return { affected: Number(result[0].affectedRows ?? 0) };
+  const result = await db.update(paymentRequests).set({ status: "expired", updatedAt: new Date() })
+    .where(and(eq(paymentRequests.status, "open"), lt(paymentRequests.expiresAt, new Date())))
+    .returning({ id: paymentRequests.id });
+  return { affected: result.length };
 }
 
 export async function setTransferControl(adminUserId: number, enabled: boolean, reason: string) {
   const db = requiredDb(await getDb());
   await db.transaction(async (tx) => {
-    await tx.insert(operationalControls).values({ control: "transfers_enabled", enabled: enabled ? 1 : 0, reason, changedByUserId: adminUserId })
-      .onDuplicateKeyUpdate({ set: { enabled: enabled ? 1 : 0, reason, changedByUserId: adminUserId, updatedAt: new Date() } });
+    await tx.insert(operationalControls).values({ control: "transfers_enabled", enabled, reason, changedByUserId: adminUserId, updatedAt: new Date() })
+      .onConflictDoUpdate({ target: operationalControls.control, set: { enabled, reason, changedByUserId: adminUserId, updatedAt: new Date() } });
     await writeAudit(tx, { actorUserId: adminUserId, actorType: "admin", action: enabled ? "transfers_resumed" : "transfers_paused", resource: "operational_control", resourceId: "transfers_enabled", requestId: crypto.randomUUID(), metadata: { reason } });
   });
 }

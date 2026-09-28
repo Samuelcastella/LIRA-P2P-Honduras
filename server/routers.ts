@@ -90,7 +90,7 @@ export const appRouter = router({
     createPaymentRequest: protectedProcedure.input(transferInput.extend({ note: z.string().trim().max(140).optional() })).mutation(async ({ ctx, input }) => {
       try {
         const result = await createPaymentRequest(ctx.user.id, input);
-        return { request: result.paymentRequest, replayed: result.replayed };
+        return { request: result.request, replayed: result.replayed };
       } catch (error) {
         return financialError(error);
       }

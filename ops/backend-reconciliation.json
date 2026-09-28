@@ -1,12 +1,12 @@
 {
-  "version": 1,
+  "version": 2,
   "baselineArtifact": "lira-p2p-honduras-hardened-v2.zip",
   "canonicalSource": "repository-root",
   "canonicalBackendMigrationReady": false,
   "database": {
     "baselineDialect": "postgresql",
-    "canonicalDialect": "mysql",
-    "status": "blocking"
+    "canonicalDialect": "postgresql",
+    "status": "verified"
   },
   "exactParityFiles": [
     "server/_core/oauth.ts",
@@ -30,6 +30,7 @@
   ],
   "migrationExitCriteria": [
     "database-dialect-and-migration-strategy-reconciled",
+    "production-postgres-major-verified",
     "auth-contract-parity-verified",
     "financial-domain-invariants-verified",
     "provider-failure-semantics-verified",
@@ -38,8 +39,29 @@
     "worker-and-reconciliation-entrypoints-verified",
     "canonical-service-entrypoints-and-builds-verified",
     "rollback-runbook-verified",
+    "incident-response-runbook-verified",
+    "observability-baseline-verified",
+    "backup-recovery-point-verified",
+    "restore-drill-verified",
     "all-CI-gates-green"
   ],
+  "exitCriteriaStatus": {
+    "database-dialect-and-migration-strategy-reconciled": "verified",
+    "auth-contract-parity-verified": "verified",
+    "financial-domain-invariants-verified": "verified",
+    "provider-failure-semantics-verified": "verified",
+    "reconciliation-parity-verified": "verified",
+    "device-trust-and-OTP-parity-verified": "verified",
+    "worker-and-reconciliation-entrypoints-verified": "verified",
+    "canonical-service-entrypoints-and-builds-verified": "verified",
+    "rollback-runbook-verified": "verified",
+    "incident-response-runbook-verified": "verified",
+    "observability-baseline-verified": "verified",
+    "backup-recovery-point-verified": "blocked",
+    "restore-drill-verified": "blocked",
+    "all-CI-gates-green": "verified",
+    "production-postgres-major-verified": "verified"
+  },
   "semanticParityFiles": [
     "server/security/domain.ts",
     "server/financial/domain.ts",
