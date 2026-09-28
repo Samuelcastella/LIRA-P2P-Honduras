@@ -1,5 +1,5 @@
 {
-  "version": 6,
+  "version": 7,
   "targetEnvironment": "production",
   "mode": "sandbox",
   "realMoneyEnabled": false,
@@ -97,8 +97,8 @@
       "evidence": "Canonical services expose sanitized health state and structured operational events/counters for dispatch and reconciliation."
     },
     "deploymentCiGate": {
-      "status": "blocked",
-      "evidence": "Authoritative Railway service config read on 2026-09-28 reports source.checkSuites=false for lira-api, lira-worker, and lira-reconciliation. Two agent attempts to set the field did not persist. Railway Wait for CI therefore remains disabled and must be enabled manually in the Railway dashboard before canonical cutover."
+      "status": "verified",
+      "evidence": "Authoritative Railway service config read on 2026-09-28 reports source.checkSuites=true for lira-api, lira-worker, and lira-reconciliation."
     },
     "candidateImageSmoke": {
       "status": "verified",
@@ -114,8 +114,8 @@
     }
   },
   "cutover": {
-    "status": "blocked",
-    "reason": "All technical/database gates are verified, but Railway Wait for CI is currently disabled on all three backend services. Cutover must not proceed until source.checkSuites=true is verified for lira-api, lira-worker, and lira-reconciliation.",
+    "status": "ready",
+    "reason": "All mandatory sandbox cutover readiness gates are verified. Proceed service-by-service in the documented order with rollback preserved.",
     "order": [
       "lira-api",
       "lira-worker",
@@ -127,8 +127,9 @@
     "preparedAt": "2026-09-28",
     "reviewedMainCommit": "65139361a761ebf1f57f30bcd995df1f0a4f2f68",
     "note": "This evidence refresh intentionally triggers the LIRA Cutover Readiness workflow so the exact post-approval candidate images are rebuilt and smoke-tested before Railway service switching.",
-    "railwayWaitForCiVerified": false,
+    "railwayWaitForCiVerified": true,
     "blockedAt": "2026-09-28",
-    "blocker": "source.checkSuites=false on API, Worker, and Reconciliation"
+    "blocker": null,
+    "verifiedAt": "2026-09-28"
   }
 }
