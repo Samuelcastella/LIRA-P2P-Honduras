@@ -91,7 +91,8 @@ for (const requiredBeforeInstall of ["pnpm-workspace.yaml", "COPY patches ./patc
 }
 
 const backendServices = ["lira-api", "lira-worker", "lira-reconciliation"];
-const canonicalCutover = reconciliation.canonicalBackendMigrationReady === true;
+const canonicalCutoverApproved = reconciliation.canonicalBackendMigrationReady === true;
+
 for (const service of backendServices) {
   const serviceContract = contract.services?.[service];
   if (!serviceContract?.dockerfile || !serviceContract?.artifactSource) {
@@ -104,11 +105,20 @@ for (const service of backendServices) {
   }
 
   const docker = read(serviceContract.dockerfile);
-  if (!canonicalCutover) {
-    if (serviceContract.artifactSource !== reconciliation.baselineArtifact) {
-      fail(`${service} must remain backed by ${reconciliation.baselineArtifact} until canonical cutover is approved`);
-      continue;
-    }
+  const isArchiveBacked = serviceContract.artifactSource === reconciliation.baselineArtifact;
+  const isCanonical = serviceContract.artifactSource === "canonical-repository";
+
+  if (!isArchiveBacked && !isCanonical) {
+    fail(`${service} artifactSource must be either ${reconciliation.baselineArtifact} or canonical-repository`);
+    continue;
+  }
+
+  if (!canonicalCutoverApproved && isCanonical) {
+    fail(`${service} cannot declare canonical-repository before canonical backend migration is approved`);
+    continue;
+  }
+
+  if (isArchiveBacked) {
     if (!fs.existsSync(serviceContract.artifactSource)) {
       fail(`${service} declares missing archive artifact: ${serviceContract.artifactSource}`);
     }
@@ -120,27 +130,29 @@ for (const service of backendServices) {
     if (unexpected.length) {
       fail(`${service} archive-backed Dockerfile has undeclared build-context COPY source(s): ${unexpected.join(", ")}`);
     }
-  } else {
-    if (serviceContract.artifactSource !== "canonical-repository") {
-      fail(`${service} must declare canonical-repository after canonical backend migration is approved`);
+    const expected = [serviceContract.dockerfile, ".dockerignore", serviceContract.artifactSource];
+    if (JSON.stringify(serviceContract.watchPatterns) !== JSON.stringify(expected)) {
+      fail(`${service} watchPatterns drifted from its archive-backed build-input contract`);
     }
-    if (docker.includes(reconciliation.baselineArtifact) || /\bunzip\b/.test(docker)) {
-      fail(`${service} canonical Dockerfile must not depend on the hardened archive`);
-    }
-    const requiredPatterns = [
-      serviceContract.dockerfile,
-      ".dockerignore",
-      "package.json",
-      "pnpm-lock.yaml",
-      "pnpm-workspace.yaml",
-      "shared/**",
-      "server/**",
-      "drizzle/**",
-    ];
-    for (const pattern of requiredPatterns) {
-      if (!serviceContract.watchPatterns?.includes(pattern)) {
-        fail(`${service} canonical watchPatterns must include ${pattern}`);
-      }
+    continue;
+  }
+
+  if (docker.includes(reconciliation.baselineArtifact) || /\bunzip\b/.test(docker)) {
+    fail(`${service} canonical Dockerfile must not depend on the hardened archive`);
+  }
+  const requiredPatterns = [
+    serviceContract.dockerfile,
+    ".dockerignore",
+    "package.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    "shared/**",
+    "server/**",
+    "drizzle/**",
+  ];
+  for (const pattern of requiredPatterns) {
+    if (!serviceContract.watchPatterns?.includes(pattern)) {
+      fail(`${service} canonical watchPatterns must include ${pattern}`);
     }
   }
 }
@@ -163,14 +175,14 @@ if (JSON.stringify(webService?.watchPatterns) !== JSON.stringify(expectedWebPatt
   fail("lira-web watchPatterns drifted from its complete build-input contract");
 }
 
-if (!canonicalCutover) {
-  for (const service of backendServices) {
-    const serviceContract = contract.services?.[service] ?? {};
-    const expected = [serviceContract.dockerfile, ".dockerignore", serviceContract.artifactSource];
-    if (JSON.stringify(serviceContract.watchPatterns) !== JSON.stringify(expected)) {
-      fail(`${service} watchPatterns drifted from its archive-backed build-input contract`);
-    }
-  }
+if (!process.exitCode) {
+  const canonicalServices = backendServices.filter(
+    (service) => contract.services?.[service]?.artifactSource === "canonical-repository",
+  );
+  const mode = canonicalServices.length === 0
+    ? "archive"
+    : canonicalServices.length === backendServices.length
+      ? "canonical"
+      : `progressive-canonical:${canonicalServices.join(",")}`;
+  console.log(`Deployment contract validation passed (backend mode: ${mode}).`);
 }
-
-if (!process.exitCode) console.log(`Deployment contract validation passed (backend mode: ${canonicalCutover ? "canonical" : "archive"}).`);
