@@ -101,8 +101,8 @@
       "evidence": "Railway Wait for CI/check-suite gating was enabled for lira-api, lira-worker, and lira-reconciliation on 2026-09-27 without triggering a deployment."
     },
     "candidateImageSmoke": {
-      "status": "validating",
-      "evidence": "Awaiting green LIRA Cutover Readiness workflow on the exact candidate commit; the workflow builds all three canonical images, runs API migrations twice on PostgreSQL 18, checks production health paths, and revalidates the hardened rollback artifact."
+      "status": "verified",
+      "evidence": "GitHub Actions 'LIRA Cutover Readiness' workflow run #6 (https://github.com/Samuelcastella/LIRA-P2P-Honduras/actions/runs/36409655413) passed on commit 089b95e0f25178d76dd1a78c397e5e18e0ab4175, the exact commit now at the tip of main: built all three ops/docker/canonical/* images, ran node scripts/migrate.mjs twice against PostgreSQL 18 to prove idempotency, received HTTP 200 from the API's /ready and from the worker's and reconciliation's /health, and revalidated the hardened rollback artifact's SHA-256 checksum."
     },
     "backupRecoveryPoint": {
       "status": "verified",
@@ -115,7 +115,7 @@
   },
   "cutover": {
     "status": "blocked",
-    "reason": "backupRecoveryPoint is now verified with real pgbackrest evidence. Do not switch backend Dockerfile paths/artifact sources until candidateImageSmoke and restoreVerification are also verified.",
+    "reason": "backupRecoveryPoint and candidateImageSmoke are now verified. Do not switch backend Dockerfile paths/artifact sources until restoreVerification is also verified via an actual disposable restore drill.",
     "order": [
       "lira-api",
       "lira-worker",
