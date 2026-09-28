@@ -57,8 +57,8 @@
     "rollback-runbook-verified": "verified",
     "incident-response-runbook-verified": "verified",
     "observability-baseline-verified": "verified",
-    "backup-recovery-point-verified": "blocked",
-    "restore-drill-verified": "blocked",
+    "backup-recovery-point-verified": "verified",
+    "restore-drill-verified": "verified",
     "all-CI-gates-green": "verified",
     "production-postgres-major-verified": "verified"
   },
