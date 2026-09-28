@@ -1,8 +1,8 @@
 {
-  "version": 2,
+  "version": 3,
   "baselineArtifact": "lira-p2p-honduras-hardened-v2.zip",
   "canonicalSource": "repository-root",
-  "canonicalBackendMigrationReady": false,
+  "canonicalBackendMigrationReady": true,
   "database": {
     "baselineDialect": "postgresql",
     "canonicalDialect": "postgresql",
@@ -83,5 +83,11 @@
       "services/worker/index.ts",
       "services/reconciliation/index.ts"
     ]
+  },
+  "migrationApproval": {
+    "status": "approved-for-sandbox-cutover",
+    "approvedAt": "2026-09-28",
+    "scope": "canonical sandbox backend cutover only",
+    "evidence": "All migration exit criteria are verified, including production PostgreSQL 18 parity, candidate image smoke, continuous backup recovery point, and successful disposable PITR restore validation. Real-money operation remains disabled."
   }
 }
