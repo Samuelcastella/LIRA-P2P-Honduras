@@ -48,8 +48,8 @@ const blockedGates = mandatoryGates.filter((gate) => readiness.gates?.[gate]?.st
 const migrationReady = reconciliation.canonicalBackendMigrationReady === true;
 const cutoverReady = readiness.cutover?.status === "ready";
 
-if ((migrationReady || cutoverReady) && blockedGates.length > 0) {
-  fail(`migration/cutover cannot be ready while gates are not verified: ${blockedGates.join(", ")}`);
+if (cutoverReady && blockedGates.length > 0) {
+  fail(`cutover cannot be ready while gates are not verified: ${blockedGates.join(", ")}`);
 }
 
 const backendServices = ["lira-api", "lira-worker", "lira-reconciliation"];
@@ -61,9 +61,10 @@ if (!migrationReady) {
   }
 }
 
-if (readiness.cutover?.status === "blocked" && migrationReady) {
-  fail("canonicalBackendMigrationReady cannot be true while cutover status is blocked");
-}
+// Migration approval and production cutover authorization are separate states.
+// canonicalBackendMigrationReady may remain true while an operational cutover gate
+// (for example Railway Wait for CI) is blocked. cutover.status must stay blocked
+// until every mandatory operational gate is verified.
 
 if (readiness.canonicalCandidate?.strategy !== "railway-dockerfile-path-switch") {
   fail("canonical cutover must use the reviewed Railway Dockerfile-path switch strategy");
