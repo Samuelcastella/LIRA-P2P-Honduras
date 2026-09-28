@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "principles": {
     "sandboxOnly": true,
     "realMoneyEnabled": false,
@@ -61,12 +61,20 @@
       ]
     },
     "lira-reconciliation": {
-      "dockerfile": "Dockerfile.reconciliation",
-      "artifactSource": "lira-p2p-honduras-hardened-v2.zip",
+      "dockerfile": "ops/docker/canonical/Dockerfile.reconciliation",
+      "artifactSource": "canonical-repository",
       "watchPatterns": [
-        "Dockerfile.reconciliation",
+        "ops/docker/canonical/Dockerfile.reconciliation",
         ".dockerignore",
-        "lira-p2p-honduras-hardened-v2.zip"
+        "package.json",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+        "patches/**",
+        "tsconfig.json",
+        "services/reconciliation/**",
+        "server/**",
+        "shared/**",
+        "drizzle/**"
       ]
     }
   },
@@ -74,14 +82,13 @@
     "mode": "progressive-canonical",
     "canonicalServices": [
       "lira-api",
-      "lira-worker"
-    ],
-    "archiveServices": [
+      "lira-worker",
       "lira-reconciliation"
     ],
-    "status": "api-verified-worker-prepared",
-    "pendingService": "lira-worker",
+    "archiveServices": [],
+    "status": "api-worker-verified-reconciliation-prepared",
+    "pendingService": "lira-reconciliation",
     "blocker": null,
-    "note": "lira-api canonical deployment a7816010-3364-4fc1-bda0-13b12d5024b4 is verified SUCCESS. Repository contract now prepares lira-worker for the next independent cutover. Reconciliation remains archive-backed."
+    "note": "lira-api and lira-worker canonical deployments are verified SUCCESS. Repository contract now prepares lira-reconciliation for the final independent cutover."
   }
 }
