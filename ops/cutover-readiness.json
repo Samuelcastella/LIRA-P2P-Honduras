@@ -1,5 +1,5 @@
 {
-  "version": 5,
+  "version": 6,
   "targetEnvironment": "production",
   "mode": "sandbox",
   "realMoneyEnabled": false,
@@ -97,8 +97,8 @@
       "evidence": "Canonical services expose sanitized health state and structured operational events/counters for dispatch and reconciliation."
     },
     "deploymentCiGate": {
-      "status": "verified",
-      "evidence": "Railway Wait for CI/check-suite gating was enabled for lira-api, lira-worker, and lira-reconciliation on 2026-09-27 without triggering a deployment."
+      "status": "blocked",
+      "evidence": "Authoritative Railway service config read on 2026-09-28 reports source.checkSuites=false for lira-api, lira-worker, and lira-reconciliation. Two agent attempts to set the field did not persist. Railway Wait for CI therefore remains disabled and must be enabled manually in the Railway dashboard before canonical cutover."
     },
     "candidateImageSmoke": {
       "status": "verified",
@@ -114,8 +114,8 @@
     }
   },
   "cutover": {
-    "status": "ready",
-    "reason": "All mandatory sandbox cutover readiness gates are verified. canonicalBackendMigrationReady remains false until the explicit canonical backend activation change; no Railway backend Dockerfile path has been switched by this evidence update.",
+    "status": "blocked",
+    "reason": "All technical/database gates are verified, but Railway Wait for CI is currently disabled on all three backend services. Cutover must not proceed until source.checkSuites=true is verified for lira-api, lira-worker, and lira-reconciliation.",
     "order": [
       "lira-api",
       "lira-worker",
@@ -126,6 +126,9 @@
     "status": "final-verification",
     "preparedAt": "2026-09-28",
     "reviewedMainCommit": "65139361a761ebf1f57f30bcd995df1f0a4f2f68",
-    "note": "This evidence refresh intentionally triggers the LIRA Cutover Readiness workflow so the exact post-approval candidate images are rebuilt and smoke-tested before Railway service switching."
+    "note": "This evidence refresh intentionally triggers the LIRA Cutover Readiness workflow so the exact post-approval candidate images are rebuilt and smoke-tested before Railway service switching.",
+    "railwayWaitForCiVerified": false,
+    "blockedAt": "2026-09-28",
+    "blocker": "source.checkSuites=false on API, Worker, and Reconciliation"
   }
 }
