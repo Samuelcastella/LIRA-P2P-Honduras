@@ -16,7 +16,7 @@ const ts = (name: string) => timestamp(name, { withTimezone: true });
 
 export const userRole = pgEnum("user_role", ["user", "admin"]);
 export const deviceTrustStatus = pgEnum("device_trust_status", ["new", "pending", "trusted", "restricted", "revoked"]);
-export const otpPurpose = pgEnum("otp_purpose", ["transfer", "device_enrollment"]);
+export const otpPurpose = pgEnum("otp_purpose", ["transfer", "savings_contribution", "device_enrollment"]);
 export const otpChallengeStatus = pgEnum("otp_challenge_status", ["issued", "verified", "consumed", "expired", "locked"]);
 export const bankAccountStatus = pgEnum("bank_account_status", ["linked", "suspended", "unlinked"]);
 export const financialAccountType = pgEnum("financial_account_type", ["user_wallet", "sandbox_clearing", "reserve", "provider_clearing", "fees"]);
@@ -36,11 +36,14 @@ export const transferStatus = pgEnum("transfer_status", [
   "expired",
 ]);
 export const riskDecision = pgEnum("risk_decision", ["allow", "challenge", "review", "block"]);
-export const journalType = pgEnum("journal_type", ["sandbox_seed", "transfer_settlement", "reversal", "adjustment"]);
+export const journalType = pgEnum("journal_type", ["sandbox_seed", "transfer_settlement", "reversal", "adjustment", "savings_contribution", "payroll_deposit"]);
 export const journalStatus = pgEnum("journal_status", ["posted"]);
 export const ledgerDirection = pgEnum("ledger_direction", ["debit", "credit"]);
 export const holdStatus = pgEnum("hold_status", ["active", "captured", "released", "expired"]);
 export const paymentRequestStatus = pgEnum("payment_request_status", ["open", "paid", "declined", "canceled", "expired"]);
+export const savingsGoalStatus = pgEnum("savings_goal_status", ["active", "paused", "archived"]);
+export const sandboxCardStatus = pgEnum("sandbox_card_status", ["active", "frozen", "closed"]);
+export const sandboxPayrollStatus = pgEnum("sandbox_payroll_status", ["active", "paused"]);
 export const riskSeverity = pgEnum("risk_severity", ["low", "medium", "high"]);
 export const auditActorType = pgEnum("audit_actor_type", ["user", "admin", "system", "provider"]);
 export const reconciliationStatus = pgEnum("reconciliation_status", ["match", "status_mismatch", "amount_mismatch", "missing_internal", "missing_external", "duplicate_external", "unknown"]);
@@ -316,6 +319,116 @@ export const paymentRequests = pgTable(
     uniqueIndex("payment_request_transfer_unique").on(table.transferId),
     index("payment_request_requester_idx").on(table.requesterUserId, table.createdAt),
     index("payment_request_status_idx").on(table.status),
+  ],
+);
+
+/** Savings balances remain ledger-derived in a dedicated reserve account. */
+export const savingsGoals = pgTable(
+  "savings_goals",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: integer("userId").notNull().references(() => users.id),
+    name: varchar("name", { length: 80 }).notNull(),
+    targetMinor: bigint("targetMinor", { mode: "number" }).notNull(),
+    reserveAccountId: varchar("reserveAccountId", { length: 64 }).notNull().references(() => financialAccounts.id),
+    status: savingsGoalStatus("status").default("active").notNull(),
+    createdAt: ts("createdAt").defaultNow().notNull(),
+    updatedAt: ts("updatedAt").defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("savings_goal_reserve_account_unique").on(table.reserveAccountId),
+    index("savings_goal_user_status_idx").on(table.userId, table.status),
+  ],
+);
+
+/** Each contribution carries its own idempotency key and posted journal. */
+export const savingsGoalContributions = pgTable(
+  "savings_goal_contributions",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    goalId: varchar("goalId", { length: 36 }).notNull().references(() => savingsGoals.id),
+    userId: integer("userId").notNull().references(() => users.id),
+    amountMinor: bigint("amountMinor", { mode: "number" }).notNull(),
+    idempotencyKey: varchar("idempotencyKey", { length: 128 }).notNull(),
+    requestFingerprint: varchar("requestFingerprint", { length: 64 }).notNull(),
+    journalId: varchar("journalId", { length: 36 }).notNull().references(() => journalTransactions.id),
+    createdAt: ts("createdAt").defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("savings_contribution_user_idempotency_unique").on(table.userId, table.idempotencyKey),
+    uniqueIndex("savings_contribution_journal_unique").on(table.journalId),
+    index("savings_contribution_goal_idx").on(table.goalId, table.createdAt),
+  ],
+);
+
+/** Withdrawals are separate immutable facts and never mutate a contribution. */
+export const savingsGoalWithdrawals = pgTable(
+  "savings_goal_withdrawals",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    goalId: varchar("goalId", { length: 36 }).notNull().references(() => savingsGoals.id),
+    userId: integer("userId").notNull().references(() => users.id),
+    amountMinor: bigint("amountMinor", { mode: "number" }).notNull(),
+    idempotencyKey: varchar("idempotencyKey", { length: 128 }).notNull(),
+    requestFingerprint: varchar("requestFingerprint", { length: 64 }).notNull(),
+    journalId: varchar("journalId", { length: 36 }).notNull().references(() => journalTransactions.id),
+    createdAt: ts("createdAt").defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("savings_withdrawal_user_idempotency_unique").on(table.userId, table.idempotencyKey),
+    uniqueIndex("savings_withdrawal_journal_unique").on(table.journalId),
+    index("savings_withdrawal_goal_idx").on(table.goalId, table.createdAt),
+  ],
+);
+
+/** No PAN, card credential, or real card processor token is persisted in sandbox. */
+export const sandboxCards = pgTable(
+  "sandbox_cards",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: integer("userId").notNull().references(() => users.id),
+    label: varchar("label", { length: 80 }).notNull(),
+    lastFour: varchar("lastFour", { length: 4 }).notNull(),
+    status: sandboxCardStatus("status").default("active").notNull(),
+    createdAt: ts("createdAt").defaultNow().notNull(),
+    updatedAt: ts("updatedAt").defaultNow().notNull(),
+  },
+  (table) => [uniqueIndex("sandbox_card_user_unique").on(table.userId)],
+);
+
+/** A direct-deposit profile is an onboarding record, not a bank routing instruction. */
+export const sandboxPayrollProfiles = pgTable(
+  "sandbox_payroll_profiles",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: integer("userId").notNull().references(() => users.id),
+    employerName: varchar("employerName", { length: 120 }).notNull(),
+    routingLabel: varchar("routingLabel", { length: 80 }).notNull(),
+    status: sandboxPayrollStatus("status").default("active").notNull(),
+    createdAt: ts("createdAt").defaultNow().notNull(),
+    updatedAt: ts("updatedAt").defaultNow().notNull(),
+  },
+  (table) => [uniqueIndex("sandbox_payroll_profile_user_unique").on(table.userId)],
+);
+
+/** Admin-triggered sandbox payroll deposits post balanced ledger entries. */
+export const sandboxPayrollDeposits = pgTable(
+  "sandbox_payroll_deposits",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    userId: integer("userId").notNull().references(() => users.id),
+    profileId: varchar("profileId", { length: 36 }).notNull().references(() => sandboxPayrollProfiles.id),
+    amountMinor: bigint("amountMinor", { mode: "number" }).notNull(),
+    idempotencyKey: varchar("idempotencyKey", { length: 128 }).notNull(),
+    requestFingerprint: varchar("requestFingerprint", { length: 64 }).notNull(),
+    journalId: varchar("journalId", { length: 36 }).notNull().references(() => journalTransactions.id),
+    createdByUserId: integer("createdByUserId").notNull().references(() => users.id),
+    createdAt: ts("createdAt").defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("sandbox_payroll_deposit_idempotency_unique").on(table.idempotencyKey),
+    uniqueIndex("sandbox_payroll_deposit_journal_unique").on(table.journalId),
+    index("sandbox_payroll_deposit_user_idx").on(table.userId, table.createdAt),
   ],
 );
 

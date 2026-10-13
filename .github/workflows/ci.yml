@@ -193,12 +193,23 @@ jobs:
           const client = await pool.connect();
           try {
             const migrations = await client.query("select count(*)::int as count from lira_schema_migrations");
-            assert(migrations.rows[0].count === 3, "expected exactly three canonical PostgreSQL migrations");
+            assert(migrations.rows[0].count === 4, "expected exactly four canonical PostgreSQL migrations");
 
             const deadLetter = await client.query(
               "select exists(select 1 from pg_enum e join pg_type t on t.oid=e.enumtypid where t.typname='outbox_status' and e.enumlabel='dead_letter') as present",
             );
             assert(deadLetter.rows[0].present === true, "outbox dead_letter enum value is missing");
+
+            const savingsPurpose = await client.query(
+              "select exists(select 1 from pg_enum e join pg_type t on t.oid=e.enumtypid where t.typname='otp_purpose' and e.enumlabel='savings_contribution') as present",
+            );
+            assert(savingsPurpose.rows[0].present === true, "savings_contribution OTP purpose is missing");
+
+            const personalFinanceTables = await client.query(
+              "select count(*)::int as count from information_schema.tables where table_schema='public' and table_name = any($1::text[])",
+              [["savings_goals", "savings_goal_contributions", "savings_goal_withdrawals", "sandbox_cards", "sandbox_payroll_profiles", "sandbox_payroll_deposits"]],
+            );
+            assert(personalFinanceTables.rows[0].count === 6, "personal-finance sandbox tables are missing");
 
             const control = await client.query(
               "select enabled from operational_controls where control='transfers_enabled'",

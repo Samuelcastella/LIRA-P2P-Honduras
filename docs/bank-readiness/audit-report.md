@@ -2,7 +2,7 @@
 
 ## Executive summary
 
-The reviewed workspace has been evolved from a UI-only P2P prototype into an **authenticated, database-backed sandbox** with a user-scoped idempotency key, explicit payment state transitions, double-entry journal construction, explainable risk decisions, audit events, a sandbox reconciliation record, a transactional provider-intent outbox, signed callback verification, PIN-plus-OTP verification for new transfer intents, user-scoped device/session records, atomic OTP consumption, PIN rotation safeguards, daily intent reservations, and an administrator-operated transfer kill switch.
+The reviewed workspace has been evolved from a UI-only P2P prototype into an **authenticated, database-backed sandbox** with a user-scoped idempotency key, explicit payment state transitions, double-entry journal construction, explainable risk decisions, audit events, a sandbox reconciliation record, a transactional provider-intent outbox, signed callback verification, PIN-plus-OTP verification for new transfer intents, user-scoped device/session records, atomic OTP consumption, PIN rotation safeguards, daily intent reservations, an administrator-operated transfer kill switch, and sandbox-only personal-finance products (savings reserves, card state and simulated payroll deposits).
 
 This is **not a real-money system**. The implementation has no external bank provider, production-delivery OTP channel, independently verifiable device control, production observability, recovery evidence or regulated operational process. The present decision is therefore **NOT_READY** for bank due diligence, provider production integration, controlled real-money pilot or production release.
 
@@ -14,21 +14,21 @@ This is **not a real-money system**. The implementation has no external bank pro
 
 | Item | Evidence |
 | --- | --- |
-| Workspace baseline | WebDev checkpoint `8aa9ebaf`; implementation changes reviewed in the current working tree prior to a new checkpoint |
-| Financial schema | `drizzle/schema.ts`, `drizzle/0001_living_revanche.sql`, `drizzle/0002_lively_roulette.sql`, `drizzle/0003_tidy_micromacro.sql`, `drizzle/0004_fast_radioactive_man.sql`, `drizzle/0005_nifty_komodo.sql` |
+| Workspace baseline | Canonical PostgreSQL repository working tree following the sandbox cutover evidence |
+| Financial schema | `drizzle/schema.ts` and canonical `db/migrations/001_initial_postgres.sql` through `004_personal_finance_sandbox.sql` |
 | Financial service | `server/db.ts`, `server/financial/domain.ts` |
 | API contracts and authorization | `server/routers.ts`, `server/_core/trpc.ts` |
 | Client handling | `client/src/pages/Home.tsx` |
-| Tests | `pnpm test`: 4 files, 16 tests passing |
+| Tests | `pnpm test`: 4 files, 21 tests passing |
 | Type and build validation | `pnpm check`; `pnpm build`: passing |
 | Dependency scan | `pnpm audit --prod`: 0 critical, 0 high, 0 moderate, 0 low |
-| Database migration verification | All 17 domain tables present in the sandbox database |
+| Database migration verification | Existing canonical schema and migration chain reviewed. `004_personal_finance_sandbox.sql` has not been run from this WebDev/TiDB environment because it targets PostgreSQL. |
 
 ### Scope limitations
 
 - No bank, card, ACH, or wallet provider was connected.
-- No production environment, CI/CD pipeline, infrastructure-as-code, backup restore, queue, device service or secret manager was reviewed.
-- Browser/OS biometrics, OTP, PIN, KYC, sessions/devices, provider webhooks and real-money settlement were not implemented.
+- No real card issuer, employer/payroll provider, ACH provider, bank account, or real-money funding source was connected.
+- Browser/OS biometrics, external OTP delivery, KYC, WebAuthn, primary-session rotation and real-money settlement remain unimplemented or simulated.
 - The current review did not substitute for an independent penetration test, legal/compliance review, or regulated financial due diligence.
 
 ## Financial integrity
@@ -45,15 +45,17 @@ This is **not a real-money system**. The implementation has no external bank pro
 - Settlement writes a sandbox reconciliation item and does not automatically repair discrepancies.
 - Provider dispatch creates a transactional outbox record; the transfer remains `processing` until an accepted provider callback posts the balanced journal.
 - Payment requests support idempotent creation, requester-scoped cancellation and expiry transition; fulfilment is not yet implemented.
+- Savings contributions and withdrawals post a separate balanced internal journal between a wallet and reserve account, require an idempotency key, and do not mutate a stored balance. Card state and simulated payroll deposits are explicitly sandbox-only.
 
 ### Tests run
 
-`server/financial/domain.test.ts` verifies balanced journal construction, mismatch rejection, same-account rejection, illegal transitions, idempotency conflicts, and risk velocity outcomes.
+`server/financial/domain.test.ts` verifies balanced transfer and internal-journal construction, mismatch rejection, same-account rejection, no transfer reference for internal journals, illegal transitions, idempotency conflicts, and risk velocity outcomes.
 
 ## Security and access controls
 
 - Financial mutations use `protectedProcedure`; administrative mutations use `adminProcedure` and check the server-side `ctx.user.role`.
 - A new transfer requires a verified, unexpired, user/session-bound OTP challenge; a conditional update consumes it exactly once within the transaction that creates the transfer intent.
+- Savings contributions and withdrawals use a distinct `savings_contribution` OTP purpose. Card state changes require a trusted-device context. Simulated payroll deposits require server-side `adminProcedure` authorization and are journaled rather than directly editing a balance.
 - Sandbox PINs and OTPs are scrypt-hashed; failed PIN attempts lock the security profile after five attempts, and OTP attempts lock after five failures. PIN rotation requires the current PIN, rejects an unchanged value and revokes other sandbox security sessions after success.
 - Device and security-session records are user-scoped; revoke procedures apply ownership checks, device revocation cascades to that device’s security sessions, and users can close all other sandbox security sessions.
 - A per-transfer safety limit and an atomic UTC-day intent reservation prevent a new transfer from exceeding the explicit sandbox velocity policy. These limits do not replace production risk controls.
@@ -81,6 +83,7 @@ This is **not a real-money system**. The implementation has no external bank pro
 | BR-006 | P2 | Observability | Canonical API readiness now checks PostgreSQL, worker/reconciliation expose sanitized health state and process counters, and all three backend services emit structured operational JSON events. A sandbox SLO/alerting baseline is documented. Durable metrics, alert routing, tracing and long-term dashboards are still absent. | `server/observability.ts`, `services/api/index.ts`, `services/worker/index.ts`, `services/reconciliation/index.ts`, `docs/operations/sandbox-slo-observability.md`. | Add durable metrics/alert routing/tracing before any provider-integrated or real-money phase. | Partially remediated |
 | BR-007 | P2 | Operational readiness | Canonical cutover/rollback, incident response, PostgreSQL backup/restore, RPO/RTO targets and machine-readable cutover gates are documented and CI-enforced. Railway production service IDs/healthchecks are captured. Continuous PITR backup (pgBackRest) is active and a disposable PostgreSQL 18 restore was completed to transaction 777 at 2026-09-28 09:24:42.116473+00. The canonical read-only restore validator then completed with `VALIDATION_SUCCESS`: all required migrations checksum-matched, all required tables and immutable/balance triggers were present, `transfers_enabled=false`, and the aggregate integrity checks reported zero unbalanced journals and zero non-HNL financial rows. Candidate images had already passed dedicated PostgreSQL 18 smoke validation. The sandbox canonical cutover readiness gate is therefore closed; real-money/provider production readiness remains a separate scope. | `ops/cutover-readiness.json`, `docs/bank-readiness/evidence/restore-drill-2026-09-28.md`, `scripts/verify-restored-postgres.mjs`, `.github/workflows/cutover-readiness.yml`, `docs/runbooks/canonical-backend-cutover.md`, `docs/runbooks/postgres-backup-restore.md`, `docs/runbooks/incident-response.md`. | Preserve restore evidence, clean up the temporary restored/validator services after the change window, and repeat restore drills periodically or before material database changes. | Remediated for sandbox cutover |
 | BR-008 | P3 | Product analytics | Weekly visual bars remain presentation-only and are not a financial reporting source. | `client/src/pages/Home.tsx`. | Replace with a separately audited reporting query before using it for operational decisions. | Open |
+| BR-009 | P1 | Product release | The canonical PostgreSQL migration for personal-finance products is written and code-level validation passes, but it was not applied from this environment because its `DATABASE_URL` points to WebDev's MySQL/TiDB service. | `db/migrations/004_personal_finance_sandbox.sql`, `evidence/verification-2026-10-13-personal-finance.md`. | Apply on the canonical PostgreSQL deployment, run migration checksum verification plus PostgreSQL integration/concurrency tests, then update the evidence. | Open |
 
 ## Blockers and conditions
 
@@ -93,6 +96,7 @@ The P1 findings are blockers for any real-money, provider-integrated or bank-fac
 3. Complete payment-request lifecycle with idempotent fulfilment and concurrency tests.
 4. Add immutable audit enforcement, observability, secrets/CI checks, backup/restore and incident-response evidence.
 5. Re-run this audit against a checkpointed release and an isolated staging environment before any bank discussion involving technical claims.
+6. Apply and verify the personal-finance migration on canonical PostgreSQL before exposing the new product UI in that environment.
 
 ## Evidence index
 
@@ -111,8 +115,11 @@ The P1 findings are blockers for any real-money, provider-integrated or bank-fac
 - `evidence/verification-2026-09-25.md`
 - `evidence/verification-2026-09-26.md`
 - `evidence/verification-2026-09-27.md`
+- `policies/sandbox-personal-finance-products.md`
+- `evidence/verification-2026-10-13-personal-finance.md`
+- `../../db/migrations/004_personal_finance_sandbox.sql`
 - `roadmap.md`
 
 ## Limitations
 
-No claim of “bank-grade,” “fully secure,” “compliant,” “certified,” or “production-ready” is made by this report. Conclusions concern only the current code, database schema, validation output and sandbox environment evidence listed above.
+No claim of “bank-grade,” “fully secure,” “compliant,” “certified,” or “production-ready” is made by this report. Conclusions concern only the current code, database schema, validation output and sandbox environment evidence listed above. The new PostgreSQL migration was not executed from the current WebDev/TiDB environment.

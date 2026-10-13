@@ -16,7 +16,13 @@ import {
   providerWebhookEvents,
   reconciliationItems,
   riskEvents,
+  sandboxCards,
+  sandboxPayrollDeposits,
+  sandboxPayrollProfiles,
   securitySessions,
+  savingsGoalContributions,
+  savingsGoals,
+  savingsGoalWithdrawals,
   transfers,
   trustedDevices,
   type InsertUser,
@@ -30,6 +36,7 @@ import {
   assertPositiveMinorAmount,
   createBalancedJournal,
   createCompensatingJournal,
+  createInternalBalancedJournal,
   createJournalReference,
   createTransferReference,
   evaluateRisk,
@@ -534,7 +541,7 @@ export async function setUserPin(userId: number, context: SecurityClientContext,
   return { success: true } as const;
 }
 
-export async function startTransferVerification(userId: number, context: SecurityClientContext) {
+export async function startTransferVerification(userId: number, context: SecurityClientContext, purpose: "transfer" | "savings_contribution" = "transfer") {
   const db = requiredDb(await getDb());
   return db.transaction(async (tx) => {
     const current = await ensureSecurityContext(tx, userId, context);
@@ -547,14 +554,14 @@ export async function startTransferVerification(userId: number, context: Securit
     const code = createOtpCode();
     const id = crypto.randomUUID();
     const expiresAt = new Date(Date.now() + SANDBOX_SECURITY_POLICY.otpLifetimeMs);
-    await tx.insert(otpChallenges).values({ id, userId, sessionId: current.sessionId, purpose: "transfer", codeHash: hashSecret(code), status: "issued", attempts: 0, expiresAt });
-    await writeAudit(tx, { actorUserId: userId, actorType: "system", action: "transfer_otp_issued", resource: "otp_challenge", resourceId: id, requestId: id, metadata: { purpose: "transfer", expiresAt: expiresAt.toISOString(), sandbox: true } });
+    await tx.insert(otpChallenges).values({ id, userId, sessionId: current.sessionId, purpose, codeHash: hashSecret(code), status: "issued", attempts: 0, expiresAt });
+    await writeAudit(tx, { actorUserId: userId, actorType: "system", action: `${purpose}_otp_issued`, resource: "otp_challenge", resourceId: id, requestId: id, metadata: { purpose, expiresAt: expiresAt.toISOString(), sandbox: true } });
     // A real product sends this through a verified out-of-band channel. This explicit return exists only for the sandbox UI.
     return { challengeId: id, expiresAt, sandboxCode: code };
   });
 }
 
-export async function verifyTransferChallenge(userId: number, context: SecurityClientContext, challengeId: string, pin: string, code: string) {
+export async function verifyTransferChallenge(userId: number, context: SecurityClientContext, challengeId: string, pin: string, code: string, purpose: "transfer" | "savings_contribution" = "transfer") {
   assertPin(pin);
   assertOtp(code);
   const db = requiredDb(await getDb());
@@ -571,7 +578,7 @@ export async function verifyTransferChallenge(userId: number, context: SecurityC
       await tx.update(userSecurityProfiles).set(next).where(eq(userSecurityProfiles.userId, userId));
       return { ok: false as const, message: next.lockedUntil ? "PIN bloqueado durante 15 minutos por intentos fallidos" : "PIN incorrecto" };
     }
-    const [challenge] = await tx.select().from(otpChallenges).where(and(eq(otpChallenges.id, challengeId), eq(otpChallenges.userId, userId), eq(otpChallenges.sessionId, current.sessionId), eq(otpChallenges.purpose, "transfer"))).limit(1);
+    const [challenge] = await tx.select().from(otpChallenges).where(and(eq(otpChallenges.id, challengeId), eq(otpChallenges.userId, userId), eq(otpChallenges.sessionId, current.sessionId), eq(otpChallenges.purpose, purpose))).limit(1);
     if (!challenge) throw new Error("El desafío de seguridad no pertenece a esta sesión");
     if (challenge.status !== "issued" || isExpired(challenge.expiresAt)) {
       if (challenge.status === "issued") await tx.update(otpChallenges).set({ status: "expired" }).where(eq(otpChallenges.id, challenge.id));
@@ -584,14 +591,14 @@ export async function verifyTransferChallenge(userId: number, context: SecurityC
     }
     await tx.update(userSecurityProfiles).set({ failedPinAttempts: 0, lockedUntil: null }).where(eq(userSecurityProfiles.userId, userId));
     await tx.update(otpChallenges).set({ status: "verified", verifiedAt: new Date() }).where(eq(otpChallenges.id, challenge.id));
-    await writeAudit(tx, { actorUserId: userId, actorType: "user", action: "transfer_otp_verified", resource: "otp_challenge", resourceId: challenge.id, requestId: challenge.id, metadata: { sessionId: current.sessionId } });
+    await writeAudit(tx, { actorUserId: userId, actorType: "user", action: `${purpose}_otp_verified`, resource: "otp_challenge", resourceId: challenge.id, requestId: challenge.id, metadata: { sessionId: current.sessionId, purpose } });
     return { ok: true as const };
   });
   if (!outcome.ok) throw new Error(outcome.message);
   return { success: true } as const;
 }
 
-async function consumeVerifiedTransferChallenge(tx: any, userId: number, sessionFingerprint: string, challengeId: string) {
+async function consumeVerifiedChallenge(tx: any, userId: number, sessionFingerprint: string, challengeId: string, purpose: "transfer" | "savings_contribution") {
   const sessionFingerprintHash = securityFingerprint(sessionFingerprint);
   const [session] = await tx.select().from(securitySessions).where(and(eq(securitySessions.userId, userId), eq(securitySessions.sessionFingerprintHash, sessionFingerprintHash))).limit(1);
   if (!session || session.revokedAt) throw new Error("La sesión de seguridad no está activa");
@@ -603,12 +610,12 @@ async function consumeVerifiedTransferChallenge(tx: any, userId: number, session
     eq(otpChallenges.id, challengeId),
     eq(otpChallenges.userId, userId),
     eq(otpChallenges.sessionId, session.id),
-    eq(otpChallenges.purpose, "transfer"),
+    eq(otpChallenges.purpose, purpose),
     eq(otpChallenges.status, "verified"),
     sql`${otpChallenges.expiresAt} > ${now}`,
   )).returning({ id: otpChallenges.id });
-  if (result.length !== 1) throw new Error("La verificación de la transferencia no es válida");
-  await writeAudit(tx, { actorUserId: userId, actorType: "system", action: "transfer_otp_consumed", resource: "otp_challenge", resourceId: challengeId, requestId: challengeId, metadata: { sessionId: session.id } });
+  if (result.length !== 1) throw new Error("La verificación de seguridad no es válida");
+  await writeAudit(tx, { actorUserId: userId, actorType: "system", action: `${purpose}_otp_consumed`, resource: "otp_challenge", resourceId: challengeId, requestId: challengeId, metadata: { sessionId: session.id, purpose } });
 }
 
 async function reserveSandboxDailyTransferLimit(tx: any, userId: number, amountMinor: number, requestId: string) {
@@ -671,6 +678,10 @@ export async function ensureSandboxWorkspace(userId: number) {
   const systemUser = await ensureSandboxSystemUser(db);
   const bankAccountId = `sandbox-bank-${userId}`;
   const walletId = `wallet-${userId}`;
+  const reserveAccountId = `savings-reserve-${userId}`;
+  const savingsGoalId = `00000000-0000-4000-8000-${String(userId).slice(-12).padStart(12, "0")}`;
+  const cardId = `00000000-0000-4000-8001-${String(userId).slice(-12).padStart(12, "0")}`;
+  const payrollProfileId = `sandbox-payroll-${userId}`;
 
   await db.transaction(async (tx) => {
     await tx.insert(financialAccounts).values({
@@ -701,6 +712,43 @@ export async function ensureSandboxWorkspace(userId: number) {
       currency: "HNL",
       status: "active",
     }).onConflictDoUpdate({ target: financialAccounts.id, set: { status: "active", bankAccountId, updatedAt: new Date() } });
+
+    await tx.insert(financialAccounts).values({
+      id: reserveAccountId,
+      userId,
+      bankAccountId: null,
+      accountType: "reserve",
+      currency: "HNL",
+      status: "active",
+    }).onConflictDoUpdate({ target: financialAccounts.id, set: { status: "active", updatedAt: new Date() } });
+
+    await tx.insert(savingsGoals).values({
+      id: savingsGoalId,
+      userId,
+      name: "Fondo de respaldo",
+      targetMinor: 100_000,
+      reserveAccountId,
+      status: "active",
+    }).onConflictDoUpdate({
+      target: savingsGoals.id,
+      set: { reserveAccountId, updatedAt: new Date() },
+    });
+
+    await tx.insert(sandboxCards).values({
+      id: cardId,
+      userId,
+      label: "Tarjeta LIRA Sandbox",
+      lastFour: String(userId).padStart(4, "0").slice(-4),
+      status: "active",
+    }).onConflictDoUpdate({ target: sandboxCards.userId, set: { updatedAt: new Date() } });
+
+    await tx.insert(sandboxPayrollProfiles).values({
+      id: payrollProfileId,
+      userId,
+      employerName: "Empleador de demostración",
+      routingLabel: `LIRA-SBX-${String(userId).padStart(6, "0")}`,
+      status: "active",
+    }).onConflictDoUpdate({ target: sandboxPayrollProfiles.userId, set: { updatedAt: new Date() } });
 
     const seedKey = `sandbox-seed-v1-${userId}`;
     const [existingSeed] = await tx.select().from(transfers).where(and(
@@ -771,7 +819,7 @@ export async function ensureSandboxWorkspace(userId: number) {
     });
   });
 
-  return { walletId, bankAccountId };
+  return { walletId, bankAccountId, reserveAccountId, savingsGoalId, cardId, payrollProfileId };
 }
 
 export async function getFinancialDashboard(userId: number) {
@@ -779,12 +827,20 @@ export async function getFinancialDashboard(userId: number) {
   const { walletId } = await ensureSandboxWorkspace(userId);
   const balanceMinor = await availableBalanceMinor(db, walletId);
   const ledgerBalanceMinor = await walletBalanceMinor(db, walletId);
-  const [accounts, recentTransfers, recentRisk, controls] = await Promise.all([
+  const [accounts, recentTransfers, recentRisk, controls, goals, cards, payrollProfiles, payrollDeposits] = await Promise.all([
     db.select().from(bankAccounts).where(and(eq(bankAccounts.userId, userId), eq(bankAccounts.status, "linked"))),
     db.select().from(transfers).where(or(eq(transfers.senderUserId, userId), eq(transfers.recipientUserId, userId))).orderBy(desc(transfers.createdAt)).limit(20),
     db.select().from(riskEvents).where(eq(riskEvents.userId, userId)).orderBy(desc(riskEvents.createdAt)).limit(8),
     db.select().from(operationalControls).where(eq(operationalControls.control, "transfers_enabled")).limit(1),
+    db.select().from(savingsGoals).where(eq(savingsGoals.userId, userId)).orderBy(savingsGoals.createdAt),
+    db.select().from(sandboxCards).where(eq(sandboxCards.userId, userId)).limit(1),
+    db.select().from(sandboxPayrollProfiles).where(eq(sandboxPayrollProfiles.userId, userId)).limit(1),
+    db.select().from(sandboxPayrollDeposits).where(eq(sandboxPayrollDeposits.userId, userId)).orderBy(desc(sandboxPayrollDeposits.createdAt)).limit(5),
   ]);
+  const savings = await Promise.all(goals.map(async (goal) => ({
+    ...goal,
+    savedMinor: await walletBalanceMinor(db, goal.reserveAccountId),
+  })));
   return {
     environment: "sandbox" as const,
     currency: "HNL" as const,
@@ -794,7 +850,265 @@ export async function getFinancialDashboard(userId: number) {
     recentTransfers,
     recentRisk,
     transfersEnabled: controls[0]?.enabled !== false,
+    personalFinance: {
+      savings,
+      card: cards[0] ?? null,
+      payrollProfile: payrollProfiles[0] ?? null,
+      recentPayrollDeposits: payrollDeposits,
+    },
   };
+}
+
+type SavingsMovementInput = {
+  goalId: string;
+  amountMinor: number;
+  idempotencyKey: string;
+  verificationChallengeId: string;
+  sessionFingerprint: string;
+};
+
+async function lockAccountsInStableOrder(tx: any, accountIds: string[]) {
+  const sorted = Array.from(new Set(accountIds)).sort();
+  for (const accountId of sorted) await lockFinancialAccount(tx, accountId);
+}
+
+export async function createSavingsGoal(userId: number, input: { name: string; targetMinor: number }) {
+  assertPositiveMinorAmount(input.targetMinor);
+  const db = requiredDb(await getDb());
+  await ensureSandboxWorkspace(userId);
+  return db.transaction(async (tx) => {
+    const id = crypto.randomUUID();
+    const reserveAccountId = `savings-reserve-${id}`;
+    await tx.insert(financialAccounts).values({
+      id: reserveAccountId,
+      userId,
+      bankAccountId: null,
+      accountType: "reserve",
+      currency: "HNL",
+      status: "active",
+    });
+    await tx.insert(savingsGoals).values({
+      id,
+      userId,
+      name: input.name.trim(),
+      targetMinor: input.targetMinor,
+      reserveAccountId,
+      status: "active",
+    });
+    await writeAudit(tx, {
+      actorUserId: userId,
+      actorType: "user",
+      action: "savings_goal_created",
+      resource: "savings_goal",
+      resourceId: id,
+      requestId: id,
+      metadata: { targetMinor: input.targetMinor, sandbox: true },
+    });
+    const [goal] = await tx.select().from(savingsGoals).where(eq(savingsGoals.id, id)).limit(1);
+    if (!goal) throw new Error("Savings goal was not persisted");
+    return goal;
+  });
+}
+
+async function getUserSavingsGoal(tx: any, userId: number, goalId: string) {
+  const [goal] = await tx.select().from(savingsGoals).where(and(
+    eq(savingsGoals.id, goalId),
+    eq(savingsGoals.userId, userId),
+  )).limit(1);
+  if (!goal || goal.status !== "active") throw new Error("La meta de ahorro no está activa o no pertenece al usuario");
+  return goal;
+}
+
+function savingsFingerprint(input: Pick<SavingsMovementInput, "goalId" | "amountMinor">, direction: "contribution" | "withdrawal") {
+  return hashAuditMetadata({ direction, goalId: input.goalId, amountMinor: input.amountMinor, currency: "HNL" });
+}
+
+export async function contributeToSavingsGoal(userId: number, input: SavingsMovementInput) {
+  assertPositiveMinorAmount(input.amountMinor);
+  const db = requiredDb(await getDb());
+  const { walletId } = await ensureSandboxWorkspace(userId);
+  const fingerprint = savingsFingerprint(input, "contribution");
+  return db.transaction(async (tx) => {
+    const [prior] = await tx.select().from(savingsGoalContributions).where(and(
+      eq(savingsGoalContributions.userId, userId),
+      eq(savingsGoalContributions.idempotencyKey, input.idempotencyKey),
+    )).limit(1);
+    if (prior) {
+      assertIdempotency(prior.requestFingerprint, fingerprint);
+      return { contribution: prior, replayed: true };
+    }
+    const goal = await getUserSavingsGoal(tx, userId, input.goalId);
+    await lockAccountsInStableOrder(tx, [walletId, goal.reserveAccountId]);
+    if (await availableBalanceMinor(tx, walletId) < input.amountMinor) {
+      throw new Error("Insufficient sandbox balance for this savings contribution");
+    }
+    await consumeVerifiedChallenge(tx, userId, input.sessionFingerprint, input.verificationChallengeId, "savings_contribution");
+    const journalId = crypto.randomUUID();
+    const contributionId = crypto.randomUUID();
+    const entries = createInternalBalancedJournal(journalId, walletId, goal.reserveAccountId, input.amountMinor);
+    await tx.insert(journalTransactions).values({
+      id: journalId,
+      reference: createJournalReference("ADJ"),
+      transferId: null,
+      type: "savings_contribution",
+      status: "posted",
+      currency: "HNL",
+    });
+    await tx.insert(ledgerEntries).values(entries);
+    await tx.insert(savingsGoalContributions).values({
+      id: contributionId,
+      goalId: goal.id,
+      userId,
+      amountMinor: input.amountMinor,
+      idempotencyKey: input.idempotencyKey,
+      requestFingerprint: fingerprint,
+      journalId,
+    });
+    await writeAudit(tx, {
+      actorUserId: userId,
+      actorType: "user",
+      action: "savings_contribution_posted",
+      resource: "savings_goal",
+      resourceId: goal.id,
+      requestId: input.idempotencyKey,
+      metadata: { amountMinor: input.amountMinor, journalId, sandbox: true },
+    });
+    const [contribution] = await tx.select().from(savingsGoalContributions).where(eq(savingsGoalContributions.id, contributionId)).limit(1);
+    if (!contribution) throw new Error("Savings contribution was not persisted");
+    return { contribution, replayed: false };
+  });
+}
+
+export async function withdrawFromSavingsGoal(userId: number, input: SavingsMovementInput) {
+  assertPositiveMinorAmount(input.amountMinor);
+  const db = requiredDb(await getDb());
+  const { walletId } = await ensureSandboxWorkspace(userId);
+  const fingerprint = savingsFingerprint(input, "withdrawal");
+  return db.transaction(async (tx) => {
+    const [prior] = await tx.select().from(savingsGoalWithdrawals).where(and(
+      eq(savingsGoalWithdrawals.userId, userId),
+      eq(savingsGoalWithdrawals.idempotencyKey, input.idempotencyKey),
+    )).limit(1);
+    if (prior) {
+      assertIdempotency(prior.requestFingerprint, fingerprint);
+      return { withdrawal: prior, replayed: true };
+    }
+    const goal = await getUserSavingsGoal(tx, userId, input.goalId);
+    await lockAccountsInStableOrder(tx, [walletId, goal.reserveAccountId]);
+    if (await availableBalanceMinor(tx, goal.reserveAccountId) < input.amountMinor) {
+      throw new Error("Insufficient saved balance for this withdrawal");
+    }
+    await consumeVerifiedChallenge(tx, userId, input.sessionFingerprint, input.verificationChallengeId, "savings_contribution");
+    const journalId = crypto.randomUUID();
+    const withdrawalId = crypto.randomUUID();
+    const entries = createInternalBalancedJournal(journalId, goal.reserveAccountId, walletId, input.amountMinor);
+    await tx.insert(journalTransactions).values({
+      id: journalId,
+      reference: createJournalReference("ADJ"),
+      transferId: null,
+      type: "savings_contribution",
+      status: "posted",
+      currency: "HNL",
+    });
+    await tx.insert(ledgerEntries).values(entries);
+    await tx.insert(savingsGoalWithdrawals).values({
+      id: withdrawalId,
+      goalId: goal.id,
+      userId,
+      amountMinor: input.amountMinor,
+      idempotencyKey: input.idempotencyKey,
+      requestFingerprint: fingerprint,
+      journalId,
+    });
+    await writeAudit(tx, {
+      actorUserId: userId,
+      actorType: "user",
+      action: "savings_withdrawal_posted",
+      resource: "savings_goal",
+      resourceId: goal.id,
+      requestId: input.idempotencyKey,
+      metadata: { amountMinor: input.amountMinor, journalId, sandbox: true },
+    });
+    const [withdrawal] = await tx.select().from(savingsGoalWithdrawals).where(eq(savingsGoalWithdrawals.id, withdrawalId)).limit(1);
+    if (!withdrawal) throw new Error("Savings withdrawal was not persisted");
+    return { withdrawal, replayed: false };
+  });
+}
+
+export async function setSandboxCardStatus(userId: number, cardId: string, status: "active" | "frozen") {
+  const db = requiredDb(await getDb());
+  const result = await db.update(sandboxCards).set({ status, updatedAt: new Date() }).where(and(
+    eq(sandboxCards.id, cardId),
+    eq(sandboxCards.userId, userId),
+    sql`${sandboxCards.status} <> 'closed'`,
+  )).returning({ id: sandboxCards.id, status: sandboxCards.status });
+  if (result.length !== 1) throw new Error("La tarjeta sandbox no está disponible para este cambio");
+  await writeAudit(db, {
+    actorUserId: userId,
+    actorType: "user",
+    action: status === "frozen" ? "sandbox_card_frozen" : "sandbox_card_unfrozen",
+    resource: "sandbox_card",
+    resourceId: cardId,
+    requestId: crypto.randomUUID(),
+    metadata: { status, sandbox: true },
+  });
+  return result[0];
+}
+
+export async function simulateSandboxPayrollDeposit(adminUserId: number, input: { userId: number; amountMinor: number; idempotencyKey: string }) {
+  assertPositiveMinorAmount(input.amountMinor);
+  if (input.amountMinor > 5_000_000) throw new Error("Sandbox payroll amount exceeds the configured demonstration limit");
+  const db = requiredDb(await getDb());
+  const { walletId, payrollProfileId } = await ensureSandboxWorkspace(input.userId);
+  const fingerprint = hashAuditMetadata({ userId: input.userId, amountMinor: input.amountMinor, currency: "HNL", kind: "sandbox_payroll" });
+  return db.transaction(async (tx) => {
+    const [prior] = await tx.select().from(sandboxPayrollDeposits).where(eq(sandboxPayrollDeposits.idempotencyKey, input.idempotencyKey)).limit(1);
+    if (prior) {
+      assertIdempotency(prior.requestFingerprint, fingerprint);
+      return { deposit: prior, replayed: true };
+    }
+    const [profile] = await tx.select().from(sandboxPayrollProfiles).where(and(
+      eq(sandboxPayrollProfiles.id, payrollProfileId),
+      eq(sandboxPayrollProfiles.userId, input.userId),
+      eq(sandboxPayrollProfiles.status, "active"),
+    )).limit(1);
+    if (!profile) throw new Error("Sandbox payroll profile is not active");
+    await lockAccountsInStableOrder(tx, [SANDBOX_CLEARING_ACCOUNT_ID, walletId]);
+    const journalId = crypto.randomUUID();
+    const depositId = crypto.randomUUID();
+    const entries = createInternalBalancedJournal(journalId, SANDBOX_CLEARING_ACCOUNT_ID, walletId, input.amountMinor);
+    await tx.insert(journalTransactions).values({
+      id: journalId,
+      reference: createJournalReference("SEED"),
+      transferId: null,
+      type: "payroll_deposit",
+      status: "posted",
+      currency: "HNL",
+    });
+    await tx.insert(ledgerEntries).values(entries);
+    await tx.insert(sandboxPayrollDeposits).values({
+      id: depositId,
+      userId: input.userId,
+      profileId: profile.id,
+      amountMinor: input.amountMinor,
+      idempotencyKey: input.idempotencyKey,
+      requestFingerprint: fingerprint,
+      journalId,
+      createdByUserId: adminUserId,
+    });
+    await writeAudit(tx, {
+      actorUserId: adminUserId,
+      actorType: "admin",
+      action: "sandbox_payroll_deposit_posted",
+      resource: "sandbox_payroll_deposit",
+      resourceId: depositId,
+      requestId: input.idempotencyKey,
+      metadata: { userId: input.userId, amountMinor: input.amountMinor, journalId, sandbox: true },
+    });
+    const [deposit] = await tx.select().from(sandboxPayrollDeposits).where(eq(sandboxPayrollDeposits.id, depositId)).limit(1);
+    if (!deposit) throw new Error("Sandbox payroll deposit was not persisted");
+    return { deposit, replayed: false };
+  });
 }
 
 async function resolveCounterpartyAccount(db: ReturnType<typeof drizzle>, handle: string) {
@@ -840,7 +1154,7 @@ export async function createSandboxTransfer(userId: number, input: Omit<Transfer
 
     assertSandboxTransferWithinSingleLimit(intent.amountMinor);
     await reserveSandboxDailyTransferLimit(tx, userId, intent.amountMinor, intent.idempotencyKey);
-    await consumeVerifiedTransferChallenge(tx, userId, sessionFingerprint, verificationChallengeId);
+    await consumeVerifiedChallenge(tx, userId, sessionFingerprint, verificationChallengeId, "transfer");
 
     const recent = await tx.select({ count: sql<number>`count(*)` }).from(transfers)
       .where(and(eq(transfers.senderUserId, userId), sql`${transfers.createdAt} > now() - interval '5 minutes'`));

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { type FormEvent, useMemo, useState } from "react";
 import { useAuth } from "@/_core/hooks/useAuth";
 import { startLogin } from "@/const";
 import { trpc } from "@/lib/trpc";
@@ -38,7 +38,7 @@ import {
   X,
 } from "lucide-react";
 
-type View = "inicio" | "actividad" | "cuentas" | "seguridad" | "admin";
+type View = "inicio" | "actividad" | "cuentas" | "dinero" | "seguridad" | "admin";
 type FlowMode = "send" | "request" | null;
 type FlowStep = "amount" | "recipient" | "review" | "auth" | "success";
 type TransactionType = "in" | "out";
@@ -73,8 +73,17 @@ const navItems: { id: View; label: string; icon: typeof HomeIcon }[] = [
   { id: "inicio", label: "Inicio", icon: HomeIcon },
   { id: "actividad", label: "Actividad", icon: Activity },
   { id: "cuentas", label: "Mis cuentas", icon: Landmark },
+  { id: "dinero", label: "Mi dinero", icon: WalletCards },
   { id: "seguridad", label: "Seguridad", icon: ShieldCheck },
 ];
+const mobileNavItems = navItems.filter((item) => ["inicio", "actividad", "dinero", "seguridad"].includes(item.id));
+
+type PersonalFinanceData = {
+  savings: { id: string; name: string; targetMinor: number; savedMinor: number; status: string }[];
+  card: { id: string; label: string; lastFour: string; status: string } | null;
+  payrollProfile: { employerName: string; routingLabel: string; status: string } | null;
+  recentPayrollDeposits: { id: string; amountMinor: number; createdAt: Date }[];
+};
 
 const formatMoney = (value: number) =>
   new Intl.NumberFormat("es-HN", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(value);
@@ -277,6 +286,14 @@ export default function Home() {
     if (activeView === "cuentas") {
       return <AccountsView accounts={dashboardQuery.data?.accounts ?? []} balance={balance} />;
     }
+    if (activeView === "dinero") {
+      return <PersonalFinanceView
+        authenticated={isAuthenticated}
+        securityContext={securityContext}
+        data={dashboardQuery.data?.personalFinance as PersonalFinanceData | undefined}
+        onRefresh={() => utils.finance.dashboard.invalidate()}
+      />;
+    }
     if (activeView === "seguridad") {
       return <SecurityView securityContext={securityContext} biometricsEnabled={biometricsEnabled} onToggle={() => setBiometricsEnabled((value) => !value)} />;
     }
@@ -382,7 +399,7 @@ export default function Home() {
       </main>
 
       <nav className="mobile-nav" aria-label="Navegación móvil">
-        {navItems.slice(0, 4).map((item) => { const Icon = item.icon; return <button key={item.id} className={activeView === item.id ? "active" : ""} onClick={() => setActiveView(item.id)}><Icon size={19} /><span>{item.label}</span></button>; })}
+        {mobileNavItems.map((item) => { const Icon = item.icon; return <button key={item.id} className={activeView === item.id ? "active" : ""} onClick={() => setActiveView(item.id)}><Icon size={19} /><span>{item.label}</span></button>; })}
       </nav>
 
       {flowMode && <PaymentFlow
@@ -504,6 +521,130 @@ function ActivityView({ transfers, onSend }: { transfers: Transfer[]; onSend: ()
 function AccountsView({ accounts, balance }: { accounts: { id: string; provider: string; displayName: string; lastFour: string; status: string }[]; balance: number }) {
   const visibleAccounts = accounts.length > 0 ? accounts : [{ id: "preview", provider: "SandboxBankAdapter", displayName: "Banco Uno Sandbox", lastFour: "8421", status: "linked" }];
   return <section className="view-section"><div className="page-heading"><div><div className="eyebrow"><Landmark size={14} /> FUENTES DE FONDOS</div><h1>Mis cuentas</h1><p>Conecta tus bancos sin exponer tus credenciales.</p></div><button className="secondary-button" onClick={() => toast.message("La vinculación real queda deshabilitada mientras el producto opera solo en sandbox.")}><Plus size={17} /> Vincular cuenta</button></div><div className="accounts-grid">{visibleAccounts.map((account, index) => <article className={index === 0 ? "bank-card primary-bank" : "bank-card"} key={account.id}><div className={index === 0 ? "bank-logo" : "bank-logo ficohsa"}>{account.displayName.slice(0, 1)}</div><div className="bank-card-top"><span>{index === 0 ? "CUENTA PRINCIPAL" : "CUENTA VINCULADA"}</span><StatusPill status="Completado" /></div><h2>{account.displayName}</h2><p>Cuenta simulada · ••••{account.lastFour}</p><strong>L {formatMoney(index === 0 ? balance : 0)}</strong><div className="bank-card-bottom"><span>{account.provider}</span><ChevronRight size={17} /></div></article>)}<button className="link-account" onClick={() => toast.message("Próximamente: flujo de vinculación con consentimiento y tokenización.")}><span><Plus size={20} /></span><strong>Vincular otra cuenta</strong><small>Usa un conector seguro</small></button></div><section className="provider-note"><div className="provider-icon"><LockKeyhole size={20} /></div><div><strong>Diseñada para integrar bancos reales</strong><p>La interfaz de proveedores está desacoplada. Hoy opera en sandbox; mañana puede conectar adaptadores autorizados.</p></div><ChevronRight size={19} /></section></section>;
+}
+
+function PersonalFinanceView({ authenticated, securityContext, data, onRefresh }: { authenticated: boolean; securityContext: SecurityContext; data?: PersonalFinanceData; onRefresh: () => Promise<unknown> }) {
+  const [movement, setMovement] = useState<"save" | "withdraw" | null>(null);
+  const [amount, setAmount] = useState("100");
+  const [challengeId, setChallengeId] = useState<string | null>(null);
+  const [sandboxOtp, setSandboxOtp] = useState<string | null>(null);
+  const [pin, setPin] = useState("");
+  const [otp, setOtp] = useState("");
+  const [goalName, setGoalName] = useState("");
+  const [goalTarget, setGoalTarget] = useState("1000");
+  const startVerificationMutation = trpc.security.startTransferVerification.useMutation();
+  const verifyMutation = trpc.security.verifyTransfer.useMutation();
+  const contributeMutation = trpc.finance.contributeSavings.useMutation();
+  const withdrawMutation = trpc.finance.withdrawSavings.useMutation();
+  const createGoalMutation = trpc.finance.createSavingsGoal.useMutation();
+  const cardStatusMutation = trpc.finance.setSandboxCardStatus.useMutation();
+  const savings = data?.savings ?? [];
+  const primaryGoal = savings[0];
+  const amountMinor = Math.round((Number(amount.replace(/[^0-9.]/g, "")) || 0) * 100);
+  const currentSaved = (primaryGoal?.savedMinor ?? 0) / 100;
+  const target = (primaryGoal?.targetMinor ?? 100_000) / 100;
+  const progress = Math.min(100, target > 0 ? (currentSaved / target) * 100 : 0);
+  const isWorking = startVerificationMutation.isPending || verifyMutation.isPending || contributeMutation.isPending || withdrawMutation.isPending;
+
+  const resetVerification = () => {
+    setChallengeId(null);
+    setSandboxOtp(null);
+    setPin("");
+    setOtp("");
+  };
+
+  const startSavingsVerification = async (direction: "save" | "withdraw") => {
+    if (!authenticated) {
+      toast.message("Inicia sesión para usar productos personales del sandbox.");
+      startLogin();
+      return;
+    }
+    if (!primaryGoal || amountMinor <= 0) {
+      toast.error("Indica un monto válido y espera a que tu meta esté disponible.");
+      return;
+    }
+    try {
+      const result = await startVerificationMutation.mutateAsync({ ...securityContext, purpose: "savings_contribution" });
+      setMovement(direction);
+      setChallengeId(result.challengeId);
+      setSandboxOtp(result.sandboxCode);
+      toast.message("OTP de demostración generado para el movimiento interno.");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "No fue posible iniciar la verificación");
+    }
+  };
+
+  const submitSavingsMovement = async () => {
+    if (!primaryGoal || !movement || !challengeId) return;
+    try {
+      await verifyMutation.mutateAsync({ ...securityContext, challengeId, pin, code: otp, purpose: "savings_contribution" });
+      const input = { goalId: primaryGoal.id, amountMinor, idempotencyKey: `savings-${crypto.randomUUID()}`, verificationChallengeId: challengeId, sessionFingerprint: securityContext.sessionFingerprint };
+      if (movement === "save") {
+        await contributeMutation.mutateAsync(input);
+        toast.success("Aporte registrado en la reserva del sandbox.");
+      } else {
+        await withdrawMutation.mutateAsync(input);
+        toast.success("Fondos liberados desde la reserva del sandbox.");
+      }
+      await onRefresh();
+      resetVerification();
+      setMovement(null);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "No fue posible completar el movimiento");
+    }
+  };
+
+  const createGoal = async (event: FormEvent) => {
+    event.preventDefault();
+    const targetMinor = Math.round((Number(goalTarget.replace(/[^0-9.]/g, "")) || 0) * 100);
+    try {
+      await createGoalMutation.mutateAsync({ ...securityContext, name: goalName, targetMinor });
+      await onRefresh();
+      setGoalName("");
+      setGoalTarget("1000");
+      toast.success("Meta creada. Sus aportes quedarán en una cuenta de reserva del sandbox.");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "No fue posible crear la meta");
+    }
+  };
+
+  const updateCardStatus = async () => {
+    if (!data?.card) return;
+    try {
+      const status = data.card.status === "frozen" ? "active" : "frozen";
+      await cardStatusMutation.mutateAsync({ ...securityContext, cardId: data.card.id, status });
+      await onRefresh();
+      toast.success(status === "frozen" ? "Tarjeta sandbox congelada." : "Tarjeta sandbox reactivada.");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "No fue posible cambiar el estado de la tarjeta");
+    }
+  };
+
+  if (!authenticated) {
+    return <section className="view-section"><div className="page-heading"><div><div className="eyebrow"><WalletCards size={14} /> PRODUCTOS PERSONALES</div><h1>Mi dinero</h1><p>Funciones de dinero y ahorro disponibles solo después de iniciar sesión.</p></div></div><div className="panel personal-empty"><WalletCards size={28} /><h2>Tu espacio financiero está listo</h2><p>Las metas, tarjeta y depósito de nómina son simulaciones respaldadas por el ledger del sandbox. No se usan datos bancarios ni dinero real.</p><button className="primary-button" onClick={() => startLogin()}>Iniciar sesión</button></div></section>;
+  }
+
+  return <section className="view-section personal-finance-view">
+    <div className="page-heading"><div><div className="eyebrow"><WalletCards size={14} /> DINERO PERSONAL · SANDBOX</div><h1>Mi dinero</h1><p>Metas, tarjeta y nómina simuladas; todos los saldos se derivan del ledger.</p></div><span className="sandbox-security-badge">SIN DINERO REAL</span></div>
+    <div className="personal-products-grid">
+      <article className="panel savings-product-card">
+        <div className="product-card-heading"><div><span className="section-kicker">AHORRO</span><h2>{primaryGoal?.name || "Preparando tu meta"}</h2></div><span className="product-icon mint"><ArrowDownLeft size={20} /></span></div>
+        <div className="savings-balance"><span>Reservado</span><strong>L {formatMoney(currentSaved)}</strong><small>Meta L {formatMoney(target)}</small></div>
+        <div className="savings-progress" aria-label={`${progress.toFixed(0)} por ciento de la meta`}><span style={{ width: `${progress}%` }} /></div>
+        <div className="savings-progress-label"><span>{progress.toFixed(0)}% de la meta</span><span>L {formatMoney(Math.max(0, target - currentSaved))} faltantes</span></div>
+        <div className="savings-action-row"><label>Monto en HNL<input value={amount} inputMode="decimal" onChange={(event) => setAmount(event.target.value.replace(/[^0-9.]/g, ""))} /></label><div><button className="secondary-button" disabled={!primaryGoal || isWorking || amountMinor <= 0} onClick={() => startSavingsVerification("withdraw")}>Retirar</button><button className="primary-button" disabled={!primaryGoal || isWorking || amountMinor <= 0} onClick={() => startSavingsVerification("save")}>Ahorrar</button></div></div>
+        <p className="product-footnote"><ShieldCheck size={15} /> Aportes y retiros requieren PIN + OTP de un dispositivo de confianza y se registran como journals balanceados.</p>
+      </article>
+      <article className="panel card-product-card">
+        <div className="product-card-heading"><div><span className="section-kicker">TARJETA</span><h2>{data?.card?.label || "Tarjeta sandbox"}</h2></div><span className="product-icon lilac"><CreditCard size={20} /></span></div>
+        <div className={data?.card?.status === "frozen" ? "sandbox-card frozen" : "sandbox-card"}><div className="card-chip" /><span>VISA · SANDBOX</span><strong>•••• •••• •••• {data?.card?.lastFour || "0000"}</strong><small>{data?.card?.status === "frozen" ? "CONGELADA" : "ACTIVA"}</small></div>
+        <div className="card-control"><div><strong>{data?.card?.status === "frozen" ? "Tarjeta congelada" : "Tarjeta activa"}</strong><p>Esta tarjeta no tiene PAN ni integración de pagos. El cambio de estado es auditado.</p></div><button className={data?.card?.status === "frozen" ? "primary-button" : "secondary-button"} disabled={!data?.card || cardStatusMutation.isPending} onClick={updateCardStatus}>{data?.card?.status === "frozen" ? "Reactivar" : "Congelar"}</button></div>
+      </article>
+      <article className="panel payroll-product-card"><div className="product-card-heading"><div><span className="section-kicker">NÓMINA</span><h2>Depósito directo demo</h2></div><span className="product-icon amber"><Banknote size={20} /></span></div><div className="payroll-routing"><span>IDENTIFICADOR DE DEMO</span><strong>{data?.payrollProfile?.routingLabel || "LIRA-SBX-000000"}</strong><small>{data?.payrollProfile?.employerName || "Empleador de demostración"} · {data?.payrollProfile?.status === "active" ? "Perfil activo" : "Perfil pausado"}</small></div><div className="payroll-history"><span>Último abono sandbox</span><strong>{data?.recentPayrollDeposits[0] ? `L ${formatMoney(data.recentPayrollDeposits[0].amountMinor / 100)}` : "Aún sin abonos"}</strong></div><p className="product-footnote"><CircleAlert size={15} /> No es una instrucción bancaria. Solo un administrador del sandbox puede simular un abono contable.</p></article>
+    </div>
+    {challengeId && movement && <section className="panel savings-verification"><div><span className="section-kicker">CONFIRMACIÓN REQUERIDA</span><h2>{movement === "save" ? "Confirma tu aporte" : "Confirma tu retiro"}</h2><p>El código caduca en cinco minutos y queda vinculado a este movimiento.</p></div>{sandboxOtp && <div className="sandbox-otp"><span>CÓDIGO DEMO DEL SANDBOX</span><strong>{sandboxOtp}</strong><small>En producción se entregaría por un canal verificado.</small></div>}<div className="verification-inputs"><label>PIN de 6 dígitos<input value={pin} onChange={(event) => setPin(event.target.value.replace(/\D/g, "").slice(0, 6))} inputMode="numeric" autoComplete="current-password" placeholder="••••••" /></label><label>Código OTP<input value={otp} onChange={(event) => setOtp(event.target.value.replace(/\D/g, "").slice(0, 6))} inputMode="numeric" autoComplete="one-time-code" placeholder="••••••" /></label></div><div className="savings-verification-actions"><button className="back-button" onClick={() => { resetVerification(); setMovement(null); }}>Cancelar</button><button className="primary-button" disabled={isWorking || pin.length !== 6 || otp.length !== 6} onClick={submitSavingsMovement}>{movement === "save" ? "Validar y ahorrar" : "Validar y retirar"}</button></div></section>}
+    <section className="panel create-goal-panel"><div><span className="section-kicker">NUEVA META</span><h2>Separa un objetivo adicional</h2><p>Crear la meta no mueve dinero; el primer aporte solicitará su propia verificación.</p></div><form onSubmit={createGoal}><label>Nombre<input value={goalName} maxLength={80} onChange={(event) => setGoalName(event.target.value)} placeholder="Ej. Viaje familiar" /></label><label>Meta en HNL<input value={goalTarget} inputMode="decimal" onChange={(event) => setGoalTarget(event.target.value.replace(/[^0-9.]/g, ""))} placeholder="1000" /></label><button className="secondary-button" disabled={createGoalMutation.isPending || goalName.trim().length < 2 || Number(goalTarget) <= 0}>Crear meta</button></form>{savings.length > 1 && <div className="additional-goals">{savings.slice(1).map((goal) => <span key={goal.id}><strong>{goal.name}</strong> · L {formatMoney(goal.savedMinor / 100)} de L {formatMoney(goal.targetMinor / 100)}</span>)}</div>}</section>
+  </section>;
 }
 
 function SecurityView({ securityContext, biometricsEnabled, onToggle }: { securityContext: SecurityContext; biometricsEnabled: boolean; onToggle: () => void }) {
@@ -654,11 +795,20 @@ function AdminView() {
   const { user } = useAuth();
   const utils = trpc.useUtils();
   const isAdmin = user?.role === "admin";
+  const [payrollUserId, setPayrollUserId] = useState("");
+  const [payrollAmount, setPayrollAmount] = useState("1000");
   const overviewQuery = trpc.financeAdmin.overview.useQuery(undefined, { enabled: isAdmin, retry: false });
   const controlMutation = trpc.financeAdmin.setTransferControl.useMutation({
     onSuccess: async () => {
       await utils.financeAdmin.overview.invalidate();
       toast.success("Control operativo actualizado y auditado.");
+    },
+    onError: (error) => toast.error(error.message),
+  });
+  const payrollMutation = trpc.financeAdmin.simulatePayrollDeposit.useMutation({
+    onSuccess: async () => {
+      await Promise.all([utils.financeAdmin.overview.invalidate(), utils.finance.dashboard.invalidate()]);
+      toast.success("Abono de nómina sandbox publicado con journal balanceado.");
     },
     onError: (error) => toast.error(error.message),
   });
@@ -676,5 +826,5 @@ function AdminView() {
   const transfersEnabled = overview?.controls.find((control) => control.control === "transfers_enabled")?.enabled !== false;
   const riskClass = (decision: string) => decision === "block" ? "block" : decision === "review" ? "review" : "allow";
 
-  return <section className="view-section admin-view"><div className="page-heading"><div><div className="eyebrow"><LayoutDashboard size={14} /> ADMINISTRACIÓN · ENTORNO SANDBOX</div><h1>Centro de control</h1><p>Datos operativos persistidos. Los saldos no son editables desde esta consola.</p></div><button className="secondary-button" onClick={() => toast.message("La exportación de evidencia se agregará junto con el paquete de due diligence.")}><ReceiptText size={17} /> Exportar reporte</button></div>{overviewQuery.isLoading ? <div className="panel loading-panel"><RefreshCw className="spin" size={20} /> Cargando datos operativos…</div> : <><div className="admin-kpis"><div className="kpi-card"><span>Transferencias registradas</span><strong>{total}</strong><small><Activity size={14} /> Datos del sandbox</small></div><div className="kpi-card"><span>Operaciones liquidadas</span><strong>{successRate}%</strong><small className="success-copy"><CheckCircle2 size={14} /> {settled} con ledger</small></div><div className="kpi-card"><span>Cola de riesgo</span><strong>{String(openRisk).padStart(2, "0")}</strong><small className={openRisk ? "warning-copy" : "success-copy"}>{openRisk ? <CircleAlert size={14} /> : <CheckCircle2 size={14} />}{openRisk ? " Requieren revisión" : " Sin bloqueos abiertos"}</small></div><div className="kpi-card"><span>Conciliación reciente</span><strong>{lastRecon?.status?.toUpperCase() || "—"}</strong><small className={lastRecon?.status === "match" ? "success-copy" : "warning-copy"}>{lastRecon?.status === "match" ? <CheckCircle2 size={14} /> : <CircleAlert size={14} />}{lastRecon ? " Ledger · proveedor" : " Aún sin registros"}</small></div></div><div className="admin-grid"><div className="panel risk-panel"><div className="panel-heading"><div><span className="section-kicker">COLA DE RIESGO</span><h2>Eventos recientes</h2></div><span className="status-pill status-request">policy sandbox-v1</span></div>{overview?.risks.length ? overview.risks.slice(0, 4).map((risk) => <div className="risk-event" key={risk.id}><span className={`risk-indicator ${riskClass(risk.decision)}`} /><div><strong>{risk.rule.replaceAll("_", " ")}</strong><p>{risk.transferId.slice(0, 12)} · score {risk.score}</p></div><span className={`risk-badge ${riskClass(risk.decision)}`}>{risk.decision.toUpperCase()}</span></div>) : <div className="empty-risk">Las decisiones de riesgo aparecerán aquí al procesar operaciones.</div>}</div><div className="panel reconciliation-panel"><div className="panel-heading"><div><span className="section-kicker">INTEGRIDAD CONTABLE</span><h2>Última conciliación</h2></div><StatusPill status={lastRecon?.status === "match" ? "Completado" : "Pendiente"} /></div><div className="recon-visual"><div><span className="recon-icon"><Banknote size={20} /></span><strong>Ledger LIRA</strong><small>{lastRecon ? `L ${formatMoney(lastRecon.expectedAmountMinor / 100)}` : "Sin movimiento"}</small></div><div className="recon-link"><span /><CheckCircle2 size={25} /><span /></div><div><span className="recon-icon provider"><Landmark size={20} /></span><strong>Proveedor</strong><small>{lastRecon ? `${lastRecon.provider}` : "SandboxBankAdapter"}</small></div></div><div className={lastRecon?.status === "match" ? "recon-match" : "recon-pending"}>{lastRecon?.status === "match" ? <><Check size={15} /> Débitos = créditos · Datos consistentes</> : <><Clock3 size={15} /> Sin evidencia de conciliación todavía</>}</div></div></div><section className="control-strip"><div><span className="section-kicker">KILL SWITCH OPERATIVO</span><strong>{transfersEnabled ? "Nuevas transferencias habilitadas" : "Nuevas transferencias pausadas"}</strong><p>La lectura de historial, auditoría y conciliación permanecen disponibles.</p></div><button className={transfersEnabled ? "pause-button" : "primary-button"} disabled={controlMutation.isPending} onClick={() => controlMutation.mutate({ enabled: !transfersEnabled, reason: transfersEnabled ? "Pausa preventiva desde la consola sandbox" : "Reanudación controlada desde la consola sandbox" })}>{transfersEnabled ? "Pausar transferencias" : "Reanudar transferencias"}</button></section></>}<div className="admin-footnote"><ShieldCheck size={18} /><span><strong>Invariante activo:</strong> toda transferencia liquidada del sandbox se publica con un débito, un crédito, una referencia y una traza de auditoría.</span></div></section>;
+  return <section className="view-section admin-view"><div className="page-heading"><div><div className="eyebrow"><LayoutDashboard size={14} /> ADMINISTRACIÓN · ENTORNO SANDBOX</div><h1>Centro de control</h1><p>Datos operativos persistidos. Los saldos no son editables desde esta consola.</p></div><button className="secondary-button" onClick={() => toast.message("La exportación de evidencia se agregará junto con el paquete de due diligence.")}><ReceiptText size={17} /> Exportar reporte</button></div>{overviewQuery.isLoading ? <div className="panel loading-panel"><RefreshCw className="spin" size={20} /> Cargando datos operativos…</div> : <><div className="admin-kpis"><div className="kpi-card"><span>Transferencias registradas</span><strong>{total}</strong><small><Activity size={14} /> Datos del sandbox</small></div><div className="kpi-card"><span>Operaciones liquidadas</span><strong>{successRate}%</strong><small className="success-copy"><CheckCircle2 size={14} /> {settled} con ledger</small></div><div className="kpi-card"><span>Cola de riesgo</span><strong>{String(openRisk).padStart(2, "0")}</strong><small className={openRisk ? "warning-copy" : "success-copy"}>{openRisk ? <CircleAlert size={14} /> : <CheckCircle2 size={14} />}{openRisk ? " Requieren revisión" : " Sin bloqueos abiertos"}</small></div><div className="kpi-card"><span>Conciliación reciente</span><strong>{lastRecon?.status?.toUpperCase() || "—"}</strong><small className={lastRecon?.status === "match" ? "success-copy" : "warning-copy"}>{lastRecon?.status === "match" ? <CheckCircle2 size={14} /> : <CircleAlert size={14} />}{lastRecon ? " Ledger · proveedor" : " Aún sin registros"}</small></div></div><div className="admin-grid"><div className="panel risk-panel"><div className="panel-heading"><div><span className="section-kicker">COLA DE RIESGO</span><h2>Eventos recientes</h2></div><span className="status-pill status-request">policy sandbox-v1</span></div>{overview?.risks.length ? overview.risks.slice(0, 4).map((risk) => <div className="risk-event" key={risk.id}><span className={`risk-indicator ${riskClass(risk.decision)}`} /><div><strong>{risk.rule.replaceAll("_", " ")}</strong><p>{risk.transferId.slice(0, 12)} · score {risk.score}</p></div><span className={`risk-badge ${riskClass(risk.decision)}`}>{risk.decision.toUpperCase()}</span></div>) : <div className="empty-risk">Las decisiones de riesgo aparecerán aquí al procesar operaciones.</div>}</div><div className="panel reconciliation-panel"><div className="panel-heading"><div><span className="section-kicker">INTEGRIDAD CONTABLE</span><h2>Última conciliación</h2></div><StatusPill status={lastRecon?.status === "match" ? "Completado" : "Pendiente"} /></div><div className="recon-visual"><div><span className="recon-icon"><Banknote size={20} /></span><strong>Ledger LIRA</strong><small>{lastRecon ? `L ${formatMoney(lastRecon.expectedAmountMinor / 100)}` : "Sin movimiento"}</small></div><div className="recon-link"><span /><CheckCircle2 size={25} /><span /></div><div><span className="recon-icon provider"><Landmark size={20} /></span><strong>Proveedor</strong><small>{lastRecon ? `${lastRecon.provider}` : "SandboxBankAdapter"}</small></div></div><div className={lastRecon?.status === "match" ? "recon-match" : "recon-pending"}>{lastRecon?.status === "match" ? <><Check size={15} /> Débitos = créditos · Datos consistentes</> : <><Clock3 size={15} /> Sin evidencia de conciliación todavía</>}</div></div></div><section className="control-strip"><div><span className="section-kicker">KILL SWITCH OPERATIVO</span><strong>{transfersEnabled ? "Nuevas transferencias habilitadas" : "Nuevas transferencias pausadas"}</strong><p>La lectura de historial, auditoría y conciliación permanecen disponibles.</p></div><button className={transfersEnabled ? "pause-button" : "primary-button"} disabled={controlMutation.isPending} onClick={() => controlMutation.mutate({ enabled: !transfersEnabled, reason: transfersEnabled ? "Pausa preventiva desde la consola sandbox" : "Reanudación controlada desde la consola sandbox" })}>{transfersEnabled ? "Pausar transferencias" : "Reanudar transferencias"}</button></section><section className="panel admin-payroll-panel"><div><span className="section-kicker">NÓMINA DE DEMOSTRACIÓN</span><h2>Publicar abono sandbox</h2><p>Esta acción está limitada a administradores y crea un journal balanceado desde la cuenta de compensación. No envía fondos ni instrucciones a un banco.</p></div><form onSubmit={(event) => { event.preventDefault(); const userId = Number(payrollUserId); const amountMinor = Math.round((Number(payrollAmount.replace(/[^0-9.]/g, "")) || 0) * 100); if (!Number.isInteger(userId) || userId <= 0 || amountMinor <= 0) { toast.error("Indica un ID de usuario y monto válidos."); return; } payrollMutation.mutate({ userId, amountMinor, idempotencyKey: `payroll-${crypto.randomUUID()}` }); }}><label>ID de usuario<input value={payrollUserId} inputMode="numeric" onChange={(event) => setPayrollUserId(event.target.value.replace(/\D/g, ""))} placeholder={user?.id ? String(user.id) : "ID"} /></label><label>Monto HNL<input value={payrollAmount} inputMode="decimal" onChange={(event) => setPayrollAmount(event.target.value.replace(/[^0-9.]/g, ""))} /></label><button className="secondary-button" disabled={payrollMutation.isPending}>Simular abono</button></form></section></>}<div className="admin-footnote"><ShieldCheck size={18} /><span><strong>Invariante activo:</strong> toda transferencia liquidada del sandbox se publica con un débito, un crédito, una referencia y una traza de auditoría.</span></div></section>;
 }

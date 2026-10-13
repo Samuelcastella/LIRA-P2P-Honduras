@@ -32,7 +32,7 @@ export type TransferIntent = {
 export type JournalEntry = {
   id: string;
   journalId: string;
-  transferId: string;
+  transferId: string | null;
   accountId: string;
   direction: LedgerDirection;
   amountMinor: number;
@@ -147,6 +147,20 @@ export function createBalancedJournal(journalId: string, transferId: string, int
       currency: intent.currency,
     },
   ];
+}
+
+/** Posts an internal sandbox movement without inventing a transfer record. */
+export function createInternalBalancedJournal(journalId: string, sourceAccountId: string, destinationAccountId: string, amountMinor: number): JournalEntry[] {
+  assertPositiveMinorAmount(amountMinor);
+  if (sourceAccountId === destinationAccountId) {
+    throw new FinancialInvariantError("Internal journal accounts must be distinct");
+  }
+  const entries: JournalEntry[] = [
+    { id: randomUUID(), journalId, transferId: null, accountId: sourceAccountId, direction: "debit", amountMinor, currency: "HNL" },
+    { id: randomUUID(), journalId, transferId: null, accountId: destinationAccountId, direction: "credit", amountMinor, currency: "HNL" },
+  ];
+  assertBalancedJournal(entries);
+  return entries;
 }
 
 export function createCompensatingJournal(journalId: string, transferId: string, originalEntries: readonly JournalEntry[]): JournalEntry[] {

@@ -7,6 +7,7 @@ import {
   assertPositiveMinorAmount,
   createBalancedJournal,
   createCompensatingJournal,
+  createInternalBalancedJournal,
   evaluateRisk,
   fingerprintIntent,
   type TransferIntent,
@@ -61,6 +62,18 @@ describe("financial transfer invariants", () => {
     expect(reversal[0].journalId).toBe("journal-reversal");
     expect(reversal[0].direction).not.toBe(original[0].direction);
     expect(() => assertBalancedJournal(reversal)).not.toThrow();
+  });
+
+  it("posts savings and payroll movements as internal balanced journals without a transfer record", () => {
+    const journal = createInternalBalancedJournal("journal-saving", "wallet-42", "reserve-42", 15_000);
+    expect(journal).toHaveLength(2);
+    expect(journal.every((entry) => entry.transferId === null)).toBe(true);
+    expect(journal.map((entry) => entry.direction).sort()).toEqual(["credit", "debit"]);
+    expect(() => assertBalancedJournal(journal)).not.toThrow();
+  });
+
+  it("rejects an internal journal that would move funds to the same account", () => {
+    expect(() => createInternalBalancedJournal("journal-invalid", "wallet-42", "wallet-42", 1_000)).toThrow(FinancialInvariantError);
   });
 
   it("keeps repeated idempotent intents stable and rejects payload changes", () => {

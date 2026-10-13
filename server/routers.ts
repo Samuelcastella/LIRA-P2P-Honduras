@@ -3,7 +3,9 @@ import { z } from "zod";
 import { COOKIE_NAME } from "@shared/const";
 import {
   cancelPaymentRequest,
+  contributeToSavingsGoal,
   createPaymentRequest,
+  createSavingsGoal,
   createSandboxTransfer,
   dispatchPendingSandboxOutbox,
   getFinancialDashboard,
@@ -13,10 +15,13 @@ import {
   revokeOtherSecuritySessions,
   revokeSecuritySession,
   revokeTrustedDevice,
+  setSandboxCardStatus,
   setTransferControl,
   setUserPin,
+  simulateSandboxPayrollDeposit,
   startTransferVerification,
   verifyTransferChallenge,
+  withdrawFromSavingsGoal,
 } from "./db";
 import { FinancialInvariantError } from "./financial/domain";
 import {
@@ -44,6 +49,14 @@ const securityContextInput = z.object({
   platform: z.string().trim().min(2).max(80),
 });
 const secureTransferInput = transferInput.extend({
+  verificationChallengeId: z.string().uuid(),
+  sessionFingerprint: z.string().min(16).max(128).regex(/^[a-zA-Z0-9_-]+$/),
+});
+const otpPurposeSchema = z.enum(["transfer", "savings_contribution"]);
+const savingsMovementInput = z.object({
+  goalId: z.string().uuid(),
+  amountMinor: z.number().int().positive().max(100_000),
+  idempotencyKey: z.string().min(12).max(128).regex(/^[a-zA-Z0-9_-]+$/),
   verificationChallengeId: z.string().uuid(),
   sessionFingerprint: z.string().min(16).max(128).regex(/^[a-zA-Z0-9_-]+$/),
 });
@@ -102,6 +115,44 @@ export const appRouter = router({
         return financialError(error);
       }
     }),
+    createSavingsGoal: protectedProcedure.input(securityContextInput.extend({
+      name: z.string().trim().min(2).max(80),
+      targetMinor: z.number().int().positive().max(10_000_000),
+    })).mutation(async ({ ctx, input }) => {
+      try {
+        await requireTrustedSecurityContext(ctx.user.id, input);
+        return await createSavingsGoal(ctx.user.id, { name: input.name, targetMinor: input.targetMinor });
+      } catch (error) {
+        return financialError(error);
+      }
+    }),
+    contributeSavings: protectedProcedure.input(savingsMovementInput).mutation(async ({ ctx, input }) => {
+      try {
+        await requireTrustedTransferSession(ctx.user.id, input.sessionFingerprint);
+        return await contributeToSavingsGoal(ctx.user.id, input);
+      } catch (error) {
+        return financialError(error);
+      }
+    }),
+    withdrawSavings: protectedProcedure.input(savingsMovementInput).mutation(async ({ ctx, input }) => {
+      try {
+        await requireTrustedTransferSession(ctx.user.id, input.sessionFingerprint);
+        return await withdrawFromSavingsGoal(ctx.user.id, input);
+      } catch (error) {
+        return financialError(error);
+      }
+    }),
+    setSandboxCardStatus: protectedProcedure.input(securityContextInput.extend({
+      cardId: z.string().uuid(),
+      status: z.enum(["active", "frozen"]),
+    })).mutation(async ({ ctx, input }) => {
+      try {
+        await requireTrustedSecurityContext(ctx.user.id, input);
+        return await setSandboxCardStatus(ctx.user.id, input.cardId, input.status);
+      } catch (error) {
+        return financialError(error);
+      }
+    }),
   }),
   security: router({
     overview: protectedProcedure.input(securityContextInput).query(async ({ ctx, input }) => {
@@ -138,18 +189,18 @@ export const appRouter = router({
         return financialError(error);
       }
     }),
-    startTransferVerification: protectedProcedure.input(securityContextInput).mutation(async ({ ctx, input }) => {
+    startTransferVerification: protectedProcedure.input(securityContextInput.extend({ purpose: otpPurposeSchema.default("transfer") })).mutation(async ({ ctx, input }) => {
       try {
         await requireTrustedSecurityContext(ctx.user.id, input);
-        return await startTransferVerification(ctx.user.id, input);
+        return await startTransferVerification(ctx.user.id, input, input.purpose);
       } catch (error) {
         return financialError(error);
       }
     }),
-    verifyTransfer: protectedProcedure.input(securityContextInput.extend({ challengeId: z.string().uuid(), pin: z.string().regex(/^\d{6}$/), code: z.string().regex(/^\d{6}$/) })).mutation(async ({ ctx, input }) => {
+    verifyTransfer: protectedProcedure.input(securityContextInput.extend({ challengeId: z.string().uuid(), pin: z.string().regex(/^\d{6}$/), code: z.string().regex(/^\d{6}$/), purpose: otpPurposeSchema.default("transfer") })).mutation(async ({ ctx, input }) => {
       try {
         await requireTrustedSecurityContext(ctx.user.id, input);
-        return await verifyTransferChallenge(ctx.user.id, input, input.challengeId, input.pin, input.code);
+        return await verifyTransferChallenge(ctx.user.id, input, input.challengeId, input.pin, input.code, input.purpose);
       } catch (error) {
         return financialError(error);
       }
@@ -202,6 +253,17 @@ export const appRouter = router({
     reconcileSandboxTransfers: adminProcedure.input(z.object({ limit: z.number().int().min(1).max(100).default(50) })).mutation(async ({ input }) => {
       try {
         return await reconcilePendingSandboxTransfers(input.limit);
+      } catch (error) {
+        return financialError(error);
+      }
+    }),
+    simulatePayrollDeposit: adminProcedure.input(z.object({
+      userId: z.number().int().positive(),
+      amountMinor: z.number().int().positive().max(5_000_000),
+      idempotencyKey: z.string().min(12).max(128).regex(/^[a-zA-Z0-9_-]+$/),
+    })).mutation(async ({ ctx, input }) => {
+      try {
+        return await simulateSandboxPayrollDeposit(ctx.user.id, input);
       } catch (error) {
         return financialError(error);
       }
